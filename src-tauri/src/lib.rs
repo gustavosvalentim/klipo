@@ -5,7 +5,7 @@ mod shortcuts;
 mod tray;
 mod window;
 
-use clipboard::{ClipboardHistory, ClipboardManager};
+use clipboard::{InMemoryClipboardHistory, ClipboardManager};
 use commands::{clear_clipboard_items, list_clipboard_items, paste_from_selection};
 use window::{window_events_handler};
 use shortcuts::register_shortcuts;
@@ -19,7 +19,7 @@ const WINDOW_HEIGHT: f64 = 300.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let clipboard_history = ClipboardHistory::new_manager();
+    let clipboard_history = InMemoryClipboardHistory::new_manager();
 
     let enigo = match Enigo::new(&Settings::default()) {
         Ok(enigo) => Arc::new(Mutex::new(enigo)),

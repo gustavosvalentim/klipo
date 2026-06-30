@@ -1,10 +1,10 @@
 use std::vec::Vec;
 
-use crate::clipboard::{ClipboardHistory, ClipboardManager, ClipboardItem};
+use crate::clipboard::{InMemoryClipboardHistory, ClipboardManager, ClipboardItem};
 use crate::paste::PasteService;
 
 #[tauri::command]
-pub fn list_clipboard_items(history: tauri::State<'_, ClipboardHistory>) -> Vec<ClipboardItem> {
+pub fn list_clipboard_items(history: tauri::State<'_, InMemoryClipboardHistory>) -> Vec<ClipboardItem> {
     match history.list() {
         Ok(items) => items,
         Err(e) => {
@@ -15,7 +15,7 @@ pub fn list_clipboard_items(history: tauri::State<'_, ClipboardHistory>) -> Vec<
 }
 
 #[tauri::command]
-pub fn clear_clipboard_items(history: tauri::State<'_, ClipboardHistory>) {
+pub fn clear_clipboard_items(history: tauri::State<'_, InMemoryClipboardHistory>) {
     match history.clear() {
         Ok(_) => {}
         Err(e) => {
