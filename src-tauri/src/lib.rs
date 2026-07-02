@@ -8,7 +8,7 @@ mod window;
 use clipboard::{ClipboardManager, InMemoryClipboardHistory};
 use commands::{clear_clipboard_items, list_clipboard_items, paste_from_selection};
 use shortcuts::register_shortcuts;
-use window::{ClipboxAppExt, ClipboxAppHandle, window_events_handler};
+use window::{create_clipbox_window, window_events_handler};
 
 use std::sync::{Arc, Mutex};
 
@@ -43,7 +43,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let mut app_handle = app.handle().clone();
+            let app_handle = app.handle().clone();
 
             let window_settings = window::Settings {
                 width: WINDOW_WIDTH,
@@ -53,7 +53,7 @@ pub fn run() {
                 radius: 12.0,
             };
 
-            if let Err(e) = app_handle.clipbox().new_window(window_settings) {
+            if let Err(e) = create_clipbox_window(&app_handle, window_settings) {
                 panic!("Failed to create clipbox window: {e}");
                 // TODO: handle this error
             }
