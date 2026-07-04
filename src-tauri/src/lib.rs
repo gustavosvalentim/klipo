@@ -6,7 +6,7 @@ mod tray;
 mod window;
 
 use clipboard::{ClipboardManager, InMemoryClipboardHistory};
-use commands::{clear_clipboard_items, list_clipboard_items, paste_from_selection};
+use commands::{clear_clipboard_items, list_clipboard_items, paste_from_selection, quit_clipbox};
 use shortcuts::register_shortcuts;
 use window::{create_clipbox_window, window_events_handler};
 
@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use enigo::{Enigo, Settings};
 
-const WINDOW_WIDTH: f64 = 200.0;
-const WINDOW_HEIGHT: f64 = 300.0;
+const WINDOW_WIDTH: f64 = 155.0;
+const WINDOW_HEIGHT: f64 = 224.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -37,7 +37,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_clipboard_items,
             paste_from_selection,
-            clear_clipboard_items
+            clear_clipboard_items,
+            quit_clipbox
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -50,7 +51,7 @@ pub fn run() {
                 height: WINDOW_HEIGHT,
                 transparent: true,
                 decorations: false,
-                radius: 12.0,
+                radius: 11.0,
             };
 
             if let Err(e) = create_clipbox_window(&app_handle, window_settings) {

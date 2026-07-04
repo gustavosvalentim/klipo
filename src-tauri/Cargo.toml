@@ -26,6 +26,7 @@ clipboard-master = "4.0.0"
 md-5 = "0.11.0"
 tauri-plugin-clipboard-manager = "2"
 enigo = "0.6.1"
+window-vibrancy = "0.7.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
