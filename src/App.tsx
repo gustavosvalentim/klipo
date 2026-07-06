@@ -140,7 +140,7 @@ function App() {
       window.removeEventListener("focus", handleFocus);
       window.removeEventListener("blur", handleBlur);
     };
-  }, [handleKeyDown]);
+  }, [handleKeyDown, handleFocus, handleBlur]);
 
   return (
     <div className="menu">
