@@ -68,10 +68,6 @@ pub fn delete_item(
     history: tauri::State<'_, InMemoryClipboardHistory>,
     text: String,
 ) {
-    // TODO: this is pretty slow when we delete the first item
-    // the issue is that we need to wait for the frontend to receive
-    // the "clipboard-changed" event, which takes a little while.
-    // Fixing this is not trivial.
     let Ok(item_idx) = history.delete(&text) else {
         println!("Failed to delete item from clipboard history");
         return;
