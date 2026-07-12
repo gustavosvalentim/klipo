@@ -1,10 +1,10 @@
 use std::sync::{Mutex, MutexGuard};
 
-use enigo::{Enigo, Direction, Key, Keyboard};
+use enigo::{Direction, Enigo, Key, Keyboard};
 use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::clipboard::{InMemoryClipboardHistory, ClipboardManager};
+use crate::clipboard::{ClipboardManager, InMemoryClipboardHistory};
 use crate::window::get_main_window;
 
 #[derive(Debug)]
@@ -24,12 +24,12 @@ impl std::fmt::Display for PasteError {
     }
 }
 
-pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), PasteError> {
+pub fn paste(app: &tauri::AppHandle, text: &str) -> Result<(), PasteError> {
     let history = app.state::<InMemoryClipboardHistory>();
     let paste_target = app.state::<PasteState>();
     let enigo = app.state::<Mutex<Enigo>>();
 
-    if !history.exists(&text) {
+    if !history.exists(text) {
         return Err(PasteError::ItemNotFound);
     }
 
@@ -37,7 +37,9 @@ pub fn paste(app: tauri::AppHandle, text: String) -> Result<(), PasteError> {
         return Err(PasteError::ClipboardError);
     }
 
-    if let Some(window) = get_main_window(&app) {
+    let _ = history.move_to_top(text);
+
+    if let Some(window) = get_main_window(app) {
         if window.hide().is_err() {
             return Err(PasteError::WindowError);
         }
@@ -124,7 +126,7 @@ impl PlatformPasteTarget {
             PlatformPasteTarget::Linux => Some(PlatformPasteTarget::Linux),
         }
     }
-    
+
     pub fn activate(&self) {
         match self {
             PlatformPasteTarget::MacOS(target) => target.activate(),
@@ -142,35 +144,27 @@ pub trait PasteTarget {
 }
 
 #[cfg(target_os = "macos")]
-pub mod macos
-{
-    use objc2_app_kit::{NSWorkspace, NSRunningApplication, NSApplicationActivationOptions};
-
+pub mod macos {
     use super::PasteTarget;
+    use crate::window::macos::{active_window_pid, set_focused_window};
 
     pub struct MacOSPasteTarget {
-       app: i32,
+        app: i32,
     }
 
     impl MacOSPasteTarget {
         pub fn new() -> Self {
-            MacOSPasteTarget {
-                app: 0,
-            }
+            MacOSPasteTarget { app: 0 }
         }
     }
 
     impl PasteTarget for MacOSPasteTarget {
         fn get_current_target(&mut self) {
-            let workspace = NSWorkspace::sharedWorkspace();
-            let app = workspace.frontmostApplication();
-
-            self.app = app.unwrap().processIdentifier();
+            self.app = active_window_pid();
         }
 
         fn activate(&self) {
-            let app = NSRunningApplication::runningApplicationWithProcessIdentifier(self.app);
-            app.unwrap().activateWithOptions(NSApplicationActivationOptions::empty());
+            set_focused_window(self.app);
         }
     }
 }

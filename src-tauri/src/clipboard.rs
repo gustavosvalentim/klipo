@@ -169,6 +169,17 @@ impl<T: ClipboardManager> ClipboardHandler for ClipboardEventsListener<T> {
     fn on_clipboard_change(&mut self) -> CallbackResult {
         println!("Clipboard changed");
 
+        let clipbox_pid = std::process::id();
+
+        #[cfg(target_os = "macos")]
+        {
+            use crate::window::macos::active_window_pid;
+
+            if active_window_pid() as u32 == clipbox_pid {
+                return CallbackResult::Next;
+            }
+        }
+
         let text = self.handler.clipboard().read_text();
 
         // TODO: add image support
@@ -212,7 +223,3 @@ pub fn clipboard_events_listener<T: ClipboardManager>(
         .expect("Failed to create clipboard listener")
 }
 
-#[cff(target_os = "macos")]
-pub mod macos {
-    
-}
