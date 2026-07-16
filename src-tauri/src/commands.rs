@@ -19,42 +19,36 @@ pub fn list_clipboard_items(history: tauri::State<'_, ClipboardStore>) -> Vec<Cl
 
 #[tauri::command]
 pub fn clear_clipboard_items(history: tauri::State<'_, ClipboardStore>) {
-    match history.clear() {
-        Ok(_) => {}
-        Err(e) => {
-            println!("Failed to clear clipboard history: {e}");
-        }
+    if let Err(e) = history.clear() {
+        println!("Failed to clear clipboard history: {e}");
     }
 }
 
 #[tauri::command]
 pub fn paste_from_selection(app: tauri::AppHandle, text: &str) {
-    match paste::paste(&app, text) {
-        Ok(_) => app.emit_clipboard_changed().unwrap(),
-        Err(e) => {
-            println!("Failed to paste from selection: {e}");
-        }
+    if let Err(e) = paste::paste(&app, text) {
+        println!("Failed to paste from selection: {e}");
     }
 }
 
 #[tauri::command]
 pub fn quit_clipbox(app: tauri::AppHandle) {
-    match get_main_window(&app) {
-        Some(window) => {
-            let _ = window.close();
-        }
-        None => println!("Failed to get main window"),
+    let Some(window) = get_main_window(&app) else {
+        println!("Failed to get main window");
+        return;
     };
+
+    let _ = window.close();
 }
 
 #[tauri::command]
 pub fn hide_clipbox(app: tauri::AppHandle) {
-    match get_main_window(&app) {
-        Some(window) => {
-            let _ = window.hide();
-        }
-        None => println!("Failed to get main window"),
+    let Some(window) = get_main_window(&app) else {
+        println!("Failed to get main window");
+        return;
     };
+
+    let _ = window.hide();
 }
 
 #[tauri::command]
@@ -64,13 +58,21 @@ pub fn delete_item(app: tauri::AppHandle, history: tauri::State<'_, ClipboardSto
         return;
     };
 
-    let item_idx = item_idx as u32;
-
-    if item_idx == 0 {
-        if let Some(item) = history.first() {
-            app.clipboard().write_text(item.text).unwrap();
-        }
+    if let Err(e) = app.emit_clipboard_changed() {
+        println!("Failed to emit clipboard changed event: {e}");
     }
 
-    app.emit_clipboard_changed().unwrap();
+    if item_idx == 0 {
+        let Some(item) = history.first() else {
+            return;
+        };
+
+        if let Err(e) = app.clipboard().write_text(item.text) {
+            println!("Failed to write text to clipboard: {e}");
+        }
+    } else {
+        if let Err(e) = app.clipboard().write_text(" ") {
+            println!("Failed to write text to clipboard: {e}");
+        }
+    }
 }
