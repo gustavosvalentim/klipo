@@ -1,0 +1,64 @@
+name: Release macOS app
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release macOS DMG
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify the tag was created from main
+        id: main
+        shell: bash
+        run: |
+          git fetch origin main
+          tag_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
+
+          if git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+            echo "The ${GITHUB_REF_NAME} tag does not point to a commit on main. No release will be created."
+          fi
+
+      - name: Set up Bun
+        if: steps.main.outputs.on_main == 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        if: steps.main.outputs.on_main == 'true'
+        run: bun install --frozen-lockfile
+
+      - name: Build the Tauri app
+        if: steps.main.outputs.on_main == 'true'
+        run: bun run tauri build
+
+      - name: Create GitHub release and upload DMG
+        if: steps.main.outputs.on_main == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          dmg_files=(src-tauri/target/release/bundle/dmg/*.dmg)
+
+          if (( ${#dmg_files[@]} == 0 )); then
+            echo "No macOS DMG was produced."
+            exit 1
+          fi
+
+          gh release create "$GITHUB_REF_NAME" "${dmg_files[@]}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
