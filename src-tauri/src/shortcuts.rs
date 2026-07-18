@@ -1,13 +1,17 @@
-use std::sync::Mutex;
-
-use enigo::{Enigo, Mouse};
+use enigo::Mouse;
 use tauri::{LogicalPosition, LogicalSize, Manager, Position, WebviewWindow};
 use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
 };
 
+use crate::input::InputState;
 use crate::paste::PasteState;
 use crate::window::get_main_window;
+
+pub enum ShortcutError {
+    InputError,
+    PoisonError,
+}
 
 fn show_on_cursor_handler(app: &tauri::AppHandle) {
     app.state::<PasteState>().load_focused_window();
@@ -17,23 +21,12 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
         return;
     };
 
-    let enigo = app.state::<Mutex<Enigo>>();
-    let Ok(enigo) = enigo.lock() else {
-        println!("Failed to get cursor position");
-        return;
-    };
-
-    let Ok((mouse_x, mouse_y)) = enigo.location() else {
-        println!("Failed to get cursor position");
-        return;
-    };
+    let (mouse_x, mouse_y) = get_cursor_position(app).unwrap_or((0, 0));
 
     // TODO: handle multi monitor setups
-    // Physical position causes the position to be off on HiDPI screens
-    // Enigo uses logical coordinates, meaning DPI affects the position.
-    // We need to clamp the position to the screen size, so we convert
-    // all sizes to logical coordinates.
-    // under the hood this is just size / scale_factor (DPI).
+    // Enigo uses logical coordinates. For reference, see:
+    // https://v2.tauri.app/reference/javascript/api/namespacedpi/#logicalsize
+    // https://v2.tauri.app/reference/javascript/api/namespacedpi/#physicalsize
     let window_size = get_window_logical_size(&window);
     let monitor_size = get_screen_logical_size(&window);
 
@@ -52,9 +45,6 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
     // Because tauri window methods are async, show() may run before
     // set_position() finishes, causing the window to briefly appear
     // on the old position before moving to the new one.
-    // Since we don't want to block the main thread, we spawn another
-    // one to wait and then show the window; otherwise the flickering
-    // will be worse, since we block the main thread for a short time.
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
@@ -127,4 +117,12 @@ fn get_screen_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
     };
 
     monitor.size().to_logical(window.scale_factor().unwrap())
+}
+
+fn get_cursor_position(app: &tauri::AppHandle) -> Result<(i32, i32), ShortcutError> {
+    let input_state = app.state::<InputState>();
+    let guard = input_state.enigo.lock().map_err(|_| ShortcutError::PoisonError)?;
+    let enigo = guard.as_ref().ok_or(ShortcutError::InputError)?;
+
+    enigo.location().map_err(|_| ShortcutError::InputError)
 }

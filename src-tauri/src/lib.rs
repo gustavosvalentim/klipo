@@ -1,5 +1,6 @@
 mod clipboard;
 mod commands;
+mod input;
 mod paste;
 mod shortcuts;
 mod tray;
@@ -7,13 +8,10 @@ mod window;
 
 use clipboard::{ClipboardEventsListener, ClipboardStore};
 use commands::{clear, close, delete_item, fetch_clipboard, paste, quit};
+use input::InputState;
 use paste::PasteState;
 use shortcuts::register_shortcuts;
 use window::{create_klipo_window, window_events_handler};
-
-use std::sync::Mutex;
-
-use enigo::{Enigo, Settings};
 
 const WINDOW_WIDTH: f64 = 250.0;
 const WINDOW_HEIGHT: f64 = 350.0;
@@ -21,20 +19,17 @@ const WINDOW_HEIGHT: f64 = 350.0;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let clipboard_store = ClipboardStore::new();
-
-    let enigo = match Enigo::new(&Settings::default()) {
-        Ok(enigo) => Mutex::new(enigo),
-        Err(e) => {
-            println!("Failed to start enigo: {e}");
-            return;
-        }
-    };
-
     let paste_target = PasteState::new();
+    let input_state = InputState::new();
+
+    if input_state.enable().is_err() {
+        // TODO: display window asking for accessibility permissions
+        println!("Failed to enable input");
+    }
 
     tauri::Builder::default()
         .manage(clipboard_store)
-        .manage(enigo)
+        .manage(input_state)
         .manage(paste_target)
         .on_window_event(window_events_handler)
         .plugin(tauri_plugin_opener::init())

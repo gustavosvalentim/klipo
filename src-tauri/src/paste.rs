@@ -5,6 +5,7 @@ use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::clipboard::ClipboardStore;
+use crate::input::InputState;
 use crate::window::get_main_window;
 
 #[derive(Debug)]
@@ -13,6 +14,7 @@ pub enum PasteError {
     ItemNotFound,
     WindowError,
     InputSimError(enigo::InputError),
+    PermissionError,
 }
 
 impl std::fmt::Display for PasteError {
@@ -22,6 +24,7 @@ impl std::fmt::Display for PasteError {
             PasteError::ItemNotFound => write!(f, "Item not found"),
             PasteError::WindowError => write!(f, "Window error"),
             PasteError::InputSimError(e) => write!(f, "Input simulation error: {e}"),
+            PasteError::PermissionError => write!(f, "Permission error"),
         }
     }
 }
@@ -29,7 +32,7 @@ impl std::fmt::Display for PasteError {
 pub fn paste_from_selection(app: &tauri::AppHandle, text: &str) -> Result<(), PasteError> {
     let history = app.state::<ClipboardStore>();
     let paste_target = app.state::<PasteState>();
-    let enigo = app.state::<Mutex<Enigo>>();
+    let input_state = app.state::<InputState>();
 
     if !history.exists(text) {
         return Err(PasteError::ItemNotFound);
@@ -51,8 +54,12 @@ pub fn paste_from_selection(app: &tauri::AppHandle, text: &str) -> Result<(), Pa
         return Err(PasteError::WindowError);
     }
 
-    if let Ok(mut enigo) = enigo.lock() {
-        let _ = simulate_paste_inputs(&mut enigo);
+    if let Ok(mut input) = input_state.enigo.lock() {
+        let Some(ref mut enigo) = *input else {
+            return Err(PasteError::PermissionError);
+        };
+
+        let _ = simulate_paste_inputs(enigo);
     }
 
     Ok(())
