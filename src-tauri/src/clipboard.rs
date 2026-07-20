@@ -8,6 +8,7 @@ use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use tauri::{Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
+use crate::state::AppState;
 use crate::window::get_focused_window;
 
 const MAX_ITEMS: usize = 120;
@@ -187,7 +188,8 @@ impl ClipboardHandler for ClipboardEventsHandler {
             return CallbackResult::Next;
         };
 
-        let store = self.app.state::<ClipboardStore>();
+        let state = self.app.state::<AppState>();
+        let store = &state.clipboard;
 
         if store.exists(&text) {
             if let Err(e) = store.move_to_top(&text) {

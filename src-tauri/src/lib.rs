@@ -1,16 +1,15 @@
 mod clipboard;
 mod commands;
 mod input;
-mod paste;
 mod shortcuts;
+mod state;
 mod tray;
 mod window;
 
-use clipboard::{ClipboardEventsListener, ClipboardStore};
+use clipboard::ClipboardEventsListener;
 use commands::{clear, close, delete_item, fetch_clipboard, paste, quit};
-use input::InputState;
-use paste::PasteState;
 use shortcuts::register_shortcuts;
+use state::AppState;
 use window::{create_klipo_window, window_events_handler};
 
 const WINDOW_WIDTH: f64 = 250.0;
@@ -18,11 +17,9 @@ const WINDOW_HEIGHT: f64 = 350.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let clipboard_store = ClipboardStore::new();
-    let paste_target = PasteState::new();
-    let input_state = InputState::new();
+    let app_state = AppState::new();
 
-    if input_state.enable().is_err() {
+    if app_state.input.enable().is_err() {
         // TODO: display window asking for accessibility permissions
         // TODO: try to identify if the user accepted the permissions
         // because running `input_state.enable()` will open the permission
@@ -31,9 +28,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .manage(clipboard_store)
-        .manage(input_state)
-        .manage(paste_target)
+        .manage(app_state)
         .on_window_event(window_events_handler)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())

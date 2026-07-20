@@ -3,6 +3,8 @@ use tauri::{
     Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
 };
 
+use crate::state::AppState;
+
 const MAIN_WINDOW_LABEL: &str = "main";
 
 pub struct Settings {
@@ -69,6 +71,48 @@ pub fn window_events_handler(window: &Window, event: &WindowEvent) {
     }
 }
 
+#[derive(Debug)]
+pub enum FocusError {
+    PlatformUnsupported,
+    StatePoisoned,
+    FocusedWindowUnavailable,
+}
+
+impl std::fmt::Display for FocusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FocusError::PlatformUnsupported => write!(f, "Platform unsupported"),
+            FocusError::StatePoisoned => write!(f, "Focused window state poisoned"),
+            FocusError::FocusedWindowUnavailable => write!(f, "Focused window unavailable"),
+        }
+    }
+}
+
+pub fn capture_focused_window(state: &AppState) -> Result<(), FocusError> {
+    let mut focused_window_pid = state
+        .focused_window_pid
+        .lock()
+        .map_err(|_| FocusError::StatePoisoned)?;
+
+    *focused_window_pid = get_focused_window();
+
+    Ok(())
+}
+
+pub fn restore_focused_window(state: &AppState) -> Result<(), FocusError> {
+    let focused_window_pid = state
+        .focused_window_pid
+        .lock()
+        .map_err(|_| FocusError::StatePoisoned)?;
+    let pid = (*focused_window_pid).ok_or(FocusError::FocusedWindowUnavailable)?;
+
+    if set_focused_window(pid) {
+        Ok(())
+    } else {
+        Err(FocusError::PlatformUnsupported)
+    }
+}
+
 pub fn get_focused_window() -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
@@ -100,7 +144,7 @@ pub fn set_focused_window(pid: i32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub mod macos {
+mod macos {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication, NSWorkspace};
 
     pub fn set_focused_window(pid: i32) -> bool {
@@ -120,7 +164,7 @@ pub mod macos {
 }
 
 #[cfg(target_os = "linux")]
-pub mod linux {
+mod linux {
     pub fn set_focused_window(_pid: i32) -> bool {
         false
     }
@@ -131,7 +175,7 @@ pub mod linux {
 }
 
 #[cfg(target_os = "windows")]
-pub mod windows {
+mod windows {
     pub fn set_focused_window(_pid: i32) -> bool {
         false
     }
