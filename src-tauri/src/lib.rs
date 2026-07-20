@@ -9,7 +9,7 @@ mod window;
 use clipboard::{ClipboardEventsListener, ClipboardStore};
 use commands::{clear, close, delete_item, fetch_clipboard, paste, quit};
 use input::InputState;
-use paste::PasteState;
+use paste::WindowManager;
 use shortcuts::register_shortcuts;
 use window::{create_klipo_window, window_events_handler};
 
@@ -19,7 +19,7 @@ const WINDOW_HEIGHT: f64 = 350.0;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let clipboard_store = ClipboardStore::new();
-    let paste_target = PasteState::new();
+    let paste_target = WindowManager::new();
     let input_state = InputState::new();
 
     if input_state.enable().is_err() {

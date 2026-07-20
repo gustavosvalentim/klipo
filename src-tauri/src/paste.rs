@@ -1,7 +1,6 @@
 use std::sync::Mutex;
 
 use enigo::{Direction, Enigo, Key, Keyboard};
-use tauri::Manager;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::clipboard::ClipboardStore;
@@ -11,58 +10,47 @@ use crate::window::get_main_window;
 #[derive(Debug)]
 pub enum PasteError {
     ClipboardError,
-    ItemNotFound,
-    WindowError,
     InputSimError(enigo::InputError),
+    ItemNotFound,
+    PoisonError,
     PermissionError,
+    WindowError,
 }
 
 impl std::fmt::Display for PasteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PasteError::ClipboardError => write!(f, "Clipboard error"),
-            PasteError::ItemNotFound => write!(f, "Item not found"),
-            PasteError::WindowError => write!(f, "Window error"),
             PasteError::InputSimError(e) => write!(f, "Input simulation error: {e}"),
+            PasteError::ItemNotFound => write!(f, "Item not found"),
             PasteError::PermissionError => write!(f, "Permission error"),
+            PasteError::PoisonError => write!(f, "Poison error"),
+            PasteError::WindowError => write!(f, "Window error"),
         }
     }
 }
 
-pub fn paste_from_selection(app: &tauri::AppHandle, text: &str) -> Result<(), PasteError> {
-    let history = app.state::<ClipboardStore>();
-    let paste_target = app.state::<PasteState>();
-    let input_state = app.state::<InputState>();
-
+pub fn paste_from_selection(app: &tauri::AppHandle, history: &ClipboardStore, paste_target: &WindowManager, input_state: &InputState, text: &str) -> Result<(), PasteError> {
     if !history.exists(text) {
         return Err(PasteError::ItemNotFound);
     }
 
-    if app.clipboard().write_text(text).is_err() {
-        return Err(PasteError::ClipboardError);
-    }
+    app.clipboard().write_text(text).map_err(|_| PasteError::ClipboardError)?;
 
     let _ = history.move_to_top(text);
 
     if let Some(window) = get_main_window(app) {
-        if window.hide().is_err() {
-            return Err(PasteError::WindowError);
-        }
+        window.hide().map_err(|_| PasteError::WindowError)?;
     }
 
-    if paste_target.restore_focus().is_err() {
-        return Err(PasteError::WindowError);
-    }
+    paste_target.restore_focus().map_err(|_| PasteError::WindowError)?;
 
-    if let Ok(mut input) = input_state.enigo.lock() {
-        let Some(ref mut enigo) = *input else {
-            return Err(PasteError::PermissionError);
-        };
+    let mut guard = input_state.enigo.lock().map_err(|_| PasteError::PoisonError)?;
+    let enigo = guard
+        .as_mut()
+        .ok_or(PasteError::PermissionError)?;
 
-        let _ = simulate_paste_inputs(enigo);
-    }
-
-    Ok(())
+    simulate_paste_inputs(enigo)
 }
 
 fn simulate_paste_inputs(enigo: &mut Enigo) -> Result<(), PasteError> {
@@ -89,17 +77,28 @@ pub struct AppInfo {
     pub pid: Option<i32>,
 }
 
-pub struct PasteState {
+pub struct WindowManager {
     last_focused_window: Mutex<AppInfo>,
 }
 
+#[derive(Debug)]
 pub enum PasteStateError {
     PlatformUnsupported,
     StatePoisonError,
     WindowHandlerError,
 }
 
-impl PasteState {
+impl std::fmt::Display for PasteStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasteStateError::PlatformUnsupported => write!(f, "Platform unsupported"),
+            PasteStateError::StatePoisonError => write!(f, "State poison error"),
+            PasteStateError::WindowHandlerError => write!(f, "Window handler error"),
+        }
+    }
+}
+
+impl WindowManager {
     pub fn new() -> Self {
         Self {
             last_focused_window: Mutex::new(AppInfo { pid: None }),
@@ -114,6 +113,11 @@ impl PasteState {
             if let Ok(mut target) = self.last_focused_window.lock() {
                 target.pid = active_window_pid();
             }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            println!("Not implemented");
         }
     }
 

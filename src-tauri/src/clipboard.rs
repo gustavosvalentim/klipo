@@ -1,7 +1,7 @@
 use md5::{Digest, Md5};
 use serde::Serialize;
 use std::io;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};

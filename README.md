@@ -32,6 +32,28 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 Klipo currently stores text only. Image clipboard support is not implemented yet, and history is not persisted across app restarts.
 
+## 🗺️ Roadmap
+
+The following work is planned to evolve Klipo from a macOS text clipboard utility into a cross-platform clipboard manager.
+
+- [ ] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
+- [ ] **Persistent history between sessions** — Save clipboard history to an application-data store, restore it at launch, and ensure clearing or deleting an item updates the stored history. This will include sensible limits for retained items and stored data size.
+- [ ] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating log files so issues can be investigated after Klipo has been running.
+- [ ] **Linux support** — Replace macOS-specific window-focus and paste behavior with Linux-compatible implementations, verify clipboard monitoring and global shortcuts across the supported desktop environments, and provide Linux build/install artifacts.
+- [ ] **Windows support** — Implement Windows focus restoration and paste behavior, validate the picker, tray, global shortcut, and clipboard monitoring on Windows, and provide Windows release artifacts.
+
+Cross-platform support depends on platform-specific focus restoration and input simulation: the current paste flow only fully supports macOS.
+
+## 📦 Install on macOS
+
+1. Open the [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases) and download the `.dmg` file for the latest release.
+2. Open the downloaded DMG, then drag **Klipo** into the **Applications** folder.
+3. Launch Klipo from Applications.
+4. Open **System Settings → Privacy & Security → Accessibility**, unlock the settings if prompted, and enable **Klipo**.
+5. Quit Klipo completely and open it again.
+
+Restarting Klipo after granting Accessibility access is a temporary workaround. It is currently needed for Klipo to simulate paste into the app that was previously active.
+
 ## 🛠️ Development
 
 Prerequisites:

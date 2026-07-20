@@ -5,7 +5,7 @@ use tauri_plugin_global_shortcut::{
 };
 
 use crate::input::InputState;
-use crate::paste::PasteState;
+use crate::paste::WindowManager;
 use crate::window::get_main_window;
 
 pub enum ShortcutError {
@@ -14,7 +14,7 @@ pub enum ShortcutError {
 }
 
 fn show_on_cursor_handler(app: &tauri::AppHandle) {
-    app.state::<PasteState>().load_focused_window();
+    app.state::<WindowManager>().load_focused_window();
 
     let Some(window) = get_main_window(app) else {
         println!("Failed to get main window");

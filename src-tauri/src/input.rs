@@ -19,18 +19,12 @@ impl InputState {
     }
 
     pub fn enable(&self) -> Result<(), InputError> {
-        let result = Enigo::new(&Settings::default());
+        let mut guard = self.enigo.lock().map_err(|_| InputError::PoisonError)?;
+        let enigo = guard.as_mut();
 
-        match result {
-            Ok(enigo) => {
-                let Ok(mut state) = self.enigo.lock() else {
-                    return Err(InputError::PoisonError);
-                };
-                *state = Some(enigo);
-            }
-            Err(_) => {
-                return Err(InputError::EnigoError);
-            }
+        if enigo.is_none() {
+            let enigo = Enigo::new(&Settings::default()).map_err(|_| InputError::EnigoError)?;
+            *guard = Some(enigo);
         }
 
         Ok(())
