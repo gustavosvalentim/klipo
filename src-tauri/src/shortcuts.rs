@@ -1,15 +1,39 @@
 use enigo::Mouse;
 use tauri::{LogicalPosition, LogicalSize, Manager, Position, WebviewWindow};
-use tauri_plugin_global_shortcut::{
-    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
-};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
+use crate::settings::ShortcutSettings;
 use crate::state::AppState;
 use crate::window::{capture_focused_window, get_main_window};
 
 pub enum ShortcutError {
     InputError,
     PoisonError,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GlobalShortcutAction {
+    OpenKlipo,
+}
+
+#[derive(Clone, Copy)]
+struct GlobalShortcutBinding {
+    action: GlobalShortcutAction,
+    shortcut: Shortcut,
+}
+
+fn global_shortcut_bindings(
+    settings: &ShortcutSettings,
+) -> Result<Vec<GlobalShortcutBinding>, String> {
+    let open_klipo = settings
+        .open_klipo
+        .parse::<Shortcut>()
+        .map_err(|_| "Open Klipo: unsupported shortcut")?;
+
+    Ok(vec![GlobalShortcutBinding {
+        action: GlobalShortcutAction::OpenKlipo,
+        shortcut: open_klipo,
+    }])
 }
 
 fn show_on_cursor_handler(app: &tauri::AppHandle) {
@@ -60,7 +84,7 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
     });
 }
 
-pub fn register_shortcuts(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+pub fn register_shortcuts_plugin(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     #[cfg(desktop)]
     {
         let global_shortcut_handler = tauri_plugin_global_shortcut::Builder::new()
@@ -68,35 +92,169 @@ pub fn register_shortcuts(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
             .build();
 
         app.plugin(global_shortcut_handler)?;
-
-        let show_window_shortcut = show_window_shortcut();
-        if let Err(e) = app.global_shortcut().register(show_window_shortcut) {
-            println!("Failed to register global shortcut: {e}");
-        }
     }
 
     Ok(())
 }
 
-fn global_shortcut_handler(app: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
-    let show_window_shortcut = show_window_shortcut();
+pub fn load_and_register_shortcuts(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    let path = settings_path(app)?;
+    let saved = crate::settings::load(&path);
+    let active_settings = register_saved_or_default(app, saved);
+    let state = app.state::<AppState>();
+    let mut shortcuts = state
+        .shortcuts
+        .lock()
+        .map_err(|_| tauri::Error::WindowNotFound)?;
+    *shortcuts = active_settings;
+    Ok(())
+}
 
-    if shortcut == &show_window_shortcut {
-        match event.state() {
-            ShortcutState::Pressed => show_on_cursor_handler(app),
-            ShortcutState::Released => {}
+fn register_saved_or_default(app: &tauri::AppHandle, saved: ShortcutSettings) -> ShortcutSettings {
+    if saved.validate().is_ok() && register_global_shortcuts(app, &saved).is_ok() {
+        return saved;
+    }
+
+    let defaults = ShortcutSettings::default();
+    if let Err(error) = register_global_shortcuts(app, &defaults) {
+        println!("Failed to register default shortcut: {error}");
+    }
+    defaults
+}
+
+fn register_global_shortcuts(
+    app: &tauri::AppHandle,
+    settings: &ShortcutSettings,
+) -> Result<(), String> {
+    settings.validate()?;
+    let bindings = global_shortcut_bindings(settings)?;
+
+    #[cfg(desktop)]
+    {
+        let shortcuts = app.global_shortcut();
+        let mut registered = Vec::new();
+        for binding in bindings {
+            if shortcuts.is_registered(binding.shortcut) {
+                continue;
+            }
+            if let Err(error) = shortcuts.register(binding.shortcut) {
+                for shortcut in registered {
+                    let _ = shortcuts.unregister(shortcut);
+                }
+                return Err(format!(
+                    "{}: macOS could not register this shortcut ({error})",
+                    next_binding_name(binding.action)
+                ));
+            }
+            registered.push(binding.shortcut);
         }
+    }
+    Ok(())
+}
+
+pub fn replace_global_shortcuts(
+    app: &tauri::AppHandle,
+    previous: &ShortcutSettings,
+    next: &ShortcutSettings,
+) -> Result<(), String> {
+    next.validate()?;
+    let previous_bindings = global_shortcut_bindings(previous)?;
+    let next_bindings = global_shortcut_bindings(next)?;
+
+    #[cfg(desktop)]
+    {
+        replace_registered_shortcuts(app, &previous_bindings, &next_bindings)?;
+    }
+    Ok(())
+}
+
+#[cfg(desktop)]
+fn replace_registered_shortcuts(
+    app: &tauri::AppHandle,
+    previous: &[GlobalShortcutBinding],
+    next: &[GlobalShortcutBinding],
+) -> Result<(), String> {
+    let shortcuts = app.global_shortcut();
+    let mut changes = Vec::new();
+    for next_binding in next {
+        match previous
+            .iter()
+            .find(|binding| binding.action == next_binding.action)
+        {
+            Some(previous_binding) if previous_binding.shortcut == next_binding.shortcut => {}
+            Some(previous_binding) => changes.push((Some(*previous_binding), Some(*next_binding))),
+            None => changes.push((None, Some(*next_binding))),
+        }
+    }
+    for previous_binding in previous {
+        if !next
+            .iter()
+            .any(|binding| binding.action == previous_binding.action)
+        {
+            changes.push((Some(*previous_binding), None));
+        }
+    }
+    let previous_registered = changes
+        .iter()
+        .filter_map(|(previous, _)| previous.as_ref())
+        .filter(|binding| shortcuts.is_registered(binding.shortcut))
+        .map(|binding| binding.shortcut)
+        .collect::<Vec<_>>();
+
+    for shortcut in &previous_registered {
+        shortcuts
+            .unregister(*shortcut)
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut registered = Vec::new();
+    for next in changes.iter().filter_map(|(_, next)| next.as_ref()) {
+        if shortcuts.is_registered(next.shortcut) {
+            continue;
+        }
+        if let Err(error) = shortcuts.register(next.shortcut) {
+            for shortcut in registered {
+                let _ = shortcuts.unregister(shortcut);
+            }
+            for shortcut in previous_registered {
+                let _ = shortcuts.register(shortcut);
+            }
+            return Err(format!(
+                "{}: macOS could not register this shortcut ({error})",
+                next_binding_name(next.action)
+            ));
+        }
+        registered.push(next.shortcut);
+    }
+    Ok(())
+}
+
+fn next_binding_name(action: GlobalShortcutAction) -> &'static str {
+    match action {
+        GlobalShortcutAction::OpenKlipo => "Open Klipo",
     }
 }
 
-fn show_window_shortcut() -> Shortcut {
-    #[cfg(target_os = "macos")]
-    let mod_key = Modifiers::META;
+pub fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, tauri::Error> {
+    Ok(app.path().app_config_dir()?.join("shortcuts.json"))
+}
 
-    #[cfg(not(target_os = "macos"))]
-    let mod_key = Modifiers::ALT;
+fn global_shortcut_handler(app: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
+    let state = app.state::<AppState>();
+    let Ok(settings) = state.shortcuts.lock() else {
+        return;
+    };
+    let Ok(bindings) = global_shortcut_bindings(&settings) else {
+        return;
+    };
+    let action = bindings
+        .iter()
+        .find(|binding| &binding.shortcut == shortcut)
+        .map(|binding| binding.action);
 
-    Shortcut::new(Some(mod_key | Modifiers::SHIFT), Code::KeyV)
+    if event.state() == ShortcutState::Pressed && action == Some(GlobalShortcutAction::OpenKlipo) {
+        show_on_cursor_handler(app);
+    }
 }
 
 fn get_window_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
@@ -107,7 +265,7 @@ fn get_window_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
         };
     };
 
-    window_size.to_logical(window.scale_factor().unwrap())
+    window_size.to_logical(window.scale_factor().unwrap_or(1.0))
 }
 
 fn get_screen_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
@@ -118,7 +276,9 @@ fn get_screen_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
         };
     };
 
-    monitor.size().to_logical(window.scale_factor().unwrap())
+    monitor
+        .size()
+        .to_logical(window.scale_factor().unwrap_or(1.0))
 }
 
 fn get_cursor_position(app: &tauri::AppHandle) -> Result<(i32, i32), ShortcutError> {

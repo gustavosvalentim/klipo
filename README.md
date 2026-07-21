@@ -16,19 +16,20 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 - Text clipboard history.
 - Global shortcut to open the picker at the cursor position.
+- Configurable keyboard shortcuts, saved between app launches.
 - Floating, always-on-top clipboard menu.
-- Keyboard navigation for selecting, deleting, and pasting items.
-- Tray icon so the app can stay resident in the background.
+- Tray icon with Settings so the app can stay resident in the background.
 - In-memory history capped at 120 text items.
 
 ## ⌨️ Usage
 
-- `Ctrl+Alt+V`: show Klipo at the current cursor position.
-- `ArrowUp` / `ArrowDown`: move through clipboard items.
-- `ArrowRight`: focus the delete action for the selected item.
-- `ArrowLeft`: return focus to the selected clipboard item.
-- `Enter`: paste the selected item, or delete it when the delete action is active.
+- `⌘⇧V`: show Klipo at the current cursor position.
+- `↑` / `↓`: move through clipboard items while the picker is focused.
+- `↩`: paste the selected item.
+- `⌦`: delete the selected item.
 - `Escape`: hide Klipo.
+
+Open **Settings…** from the tray menu to record and save replacement key combinations. Only the Open Klipo shortcut is global; navigation, paste, and delete shortcuts apply while the picker is focused. Escape is fixed and cannot be changed.
 
 Klipo currently stores text only. Image clipboard support is not implemented yet, and history is not persisted across app restarts.
 

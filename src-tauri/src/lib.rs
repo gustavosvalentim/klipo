@@ -1,14 +1,17 @@
 mod clipboard;
 mod commands;
 mod input;
+mod settings;
 mod shortcuts;
 mod state;
 mod tray;
 mod window;
 
 use clipboard::ClipboardEventsListener;
-use commands::{clear, close, delete_item, fetch_clipboard, paste, quit};
-use shortcuts::register_shortcuts;
+use commands::{
+    clear, close, delete_item, fetch_clipboard, get_shortcuts, paste, quit, save_shortcuts,
+};
+use shortcuts::{load_and_register_shortcuts, register_shortcuts_plugin};
 use state::AppState;
 use window::{create_klipo_window, window_events_handler};
 
@@ -39,6 +42,8 @@ pub fn run() {
             quit,
             close,
             delete_item,
+            get_shortcuts,
+            save_shortcuts,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -53,7 +58,8 @@ pub fn run() {
                 decorations: false,
             };
 
-            register_shortcuts(&app_handle)?;
+            register_shortcuts_plugin(&app_handle)?;
+            load_and_register_shortcuts(&app_handle)?;
             tray::create(&app_handle)?;
             create_klipo_window(&app_handle, window_settings)
                 .map_err(|_| tauri::Error::WindowNotFound)?;

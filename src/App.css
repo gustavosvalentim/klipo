@@ -26,6 +26,83 @@ button {
 	font: inherit;
 }
 
+.settings {
+	min-height: 100%;
+	padding: 34px 38px 28px;
+	color: #f5f5f7;
+	background:
+		linear-gradient(rgba(255, 255, 255, 0.018), rgba(255, 255, 255, 0)), #1e1e1f;
+}
+
+.settings h1 {
+	margin: 0 0 8px;
+	font-size: 24px;
+	font-weight: 650;
+	letter-spacing: -0.35px;
+}
+.settings > p {
+	max-width: 440px;
+	margin: 0 0 26px;
+	color: #a1a1a6;
+	font-size: 14px;
+	line-height: 1.4;
+}
+.settings__field {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	min-height: 48px;
+	margin: 0;
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
+	font-size: 15px;
+	font-weight: 500;
+}
+.settings__field:last-of-type {
+	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.settings__shortcut {
+	min-width: 132px;
+	padding: 7px 12px;
+	border: 1px solid rgba(255, 255, 255, 0.18);
+	border-radius: 7px;
+	color: #f5f5f7;
+	background: rgba(255, 255, 255, 0.1);
+	box-shadow: inset 0 1px rgba(255, 255, 255, 0.05);
+	cursor: pointer;
+}
+.settings__shortcut.is-recording {
+	border-color: #0a84ff;
+	box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.38);
+}
+.settings__shortcut:hover {
+	background: rgba(255, 255, 255, 0.16);
+}
+.settings .settings__error {
+	margin-top: 14px;
+	color: #ff6961;
+}
+.settings__actions {
+	display: flex;
+	justify-content: end;
+	margin-top: 20px;
+}
+.settings__actions button {
+	min-width: 112px;
+	padding: 7px 14px;
+	border: 0;
+	border-radius: 7px;
+	color: white;
+	background: #0a84ff;
+	box-shadow: inset 0 1px rgba(255, 255, 255, 0.16);
+	cursor: pointer;
+}
+.settings__actions button:disabled {
+	cursor: default;
+	color: #8e8e93;
+	background: rgba(255, 255, 255, 0.11);
+	box-shadow: none;
+}
+
 .menu {
 	position: relative;
 	width: 100vw;

@@ -7,12 +7,50 @@ use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem};
 use crate::input::simulate_paste_input;
 use crate::state::AppState;
 use crate::window::{get_main_window, restore_focused_window};
+use crate::{settings::ShortcutSettings, shortcuts};
 
 #[tauri::command]
 pub fn fetch_clipboard(state: State<'_, AppState>) -> Vec<ClipboardItem> {
     println!("Fetch clipboard");
 
     state.clipboard.list().unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn get_shortcuts(state: State<'_, AppState>) -> Result<ShortcutSettings, String> {
+    state
+        .shortcuts
+        .lock()
+        .map(|settings| settings.clone())
+        .map_err(|_| "Shortcut settings are unavailable".into())
+}
+
+#[tauri::command]
+pub fn save_shortcuts(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: ShortcutSettings,
+) -> Result<ShortcutSettings, String> {
+    settings.validate()?;
+
+    let mut active_shortcuts = state
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable")?;
+
+    let previous = active_shortcuts.clone();
+
+    shortcuts::replace_global_shortcuts(&app, &previous, &settings)?;
+
+    let path = shortcuts::settings_path(&app).map_err(|error| error.to_string())?;
+    if let Err(error) = crate::settings::save(&path, &settings) {
+        let _ = shortcuts::replace_global_shortcuts(&app, &settings, &previous);
+        return Err(format!("Could not save shortcut settings: {error}"));
+    }
+
+    *active_shortcuts = settings.clone();
+
+    Ok(settings)
 }
 
 #[tauri::command]

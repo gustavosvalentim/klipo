@@ -1,11 +1,7 @@
-import { Delete } from "react-feather";
-
 export type ListItemProps = {
 	label: string;
 	onClick?: () => void;
-	onDelete?: () => void;
 	active?: boolean;
-	deleteItemActive?: boolean;
 };
 
 type ListItemButtonProps = React.PropsWithChildren & {
@@ -42,32 +38,18 @@ export const ListItem = ({
 	label,
 	onClick,
 	active,
-	deleteItemActive,
-	onDelete,
 	...props
 }: ListItemProps) => (
-	<div className="flex w-full justify-between items-center my-1 gap-1">
-		<div className="flex min-w-0 flex-1 justify-left items-center">
-			<ListItemButton
-				onClick={onClick}
-				className="hover:bg-[#0a84ff] px-2"
-				active={active && !deleteItemActive}
-				{...props}
-			>
-				<span className="block text-sm min-w-0 text-nowrap whitespace-nowrap text-ellipsis overflow-hidden">
-					{label}
-				</span>
-			</ListItemButton>
-		</div>
-
-		<div className="shrink-0 flex justify-right items-center mr-2">
-			<ListItemButton
-				className="cursor-pointer px-1"
-				onClick={onDelete}
-				active={deleteItemActive}
-			>
-				<Delete className="w-4 h-4 m-auto" />
-			</ListItemButton>
-		</div>
+	<div className="flex w-full items-center my-1">
+		<ListItemButton
+			onClick={onClick}
+			className="hover:bg-[#0a84ff] px-2"
+			active={active}
+			{...props}
+		>
+			<span className="block text-sm min-w-0 text-nowrap whitespace-nowrap text-ellipsis overflow-hidden">
+				{label}
+			</span>
+		</ListItemButton>
 	</div>
 );

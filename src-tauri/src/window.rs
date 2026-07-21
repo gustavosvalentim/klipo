@@ -6,6 +6,7 @@ use tauri::{
 use crate::state::AppState;
 
 const MAIN_WINDOW_LABEL: &str = "main";
+const SETTINGS_WINDOW_LABEL: &str = "settings";
 
 pub struct Settings {
     pub width: f64,
@@ -63,7 +64,28 @@ pub fn get_main_window(app: &tauri::AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(MAIN_WINDOW_LABEL)
 }
 
+pub fn show_settings_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    let window = match app.get_webview_window(SETTINGS_WINDOW_LABEL) {
+        Some(window) => window,
+        None => WebviewWindowBuilder::new(app, SETTINGS_WINDOW_LABEL, WebviewUrl::default())
+            .title("Klipo Settings")
+            .inner_size(560.0, 510.0)
+            .min_inner_size(560.0, 510.0)
+            .resizable(false)
+            .build()?,
+    };
+    window.show()?;
+    window.set_focus()
+}
+
 pub fn window_events_handler(window: &Window, event: &WindowEvent) {
+    if window.label() == SETTINGS_WINDOW_LABEL {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = window.hide();
+        }
+        return;
+    }
     if let WindowEvent::Focused(focused) = event {
         if !focused {
             let _ = window.hide();

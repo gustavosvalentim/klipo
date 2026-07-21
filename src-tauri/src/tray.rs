@@ -1,12 +1,18 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 
+use crate::window::show_settings_window;
+
 pub fn create(app: &tauri::AppHandle) -> Result<TrayIcon, tauri::Error> {
+    let Ok(settings_item) = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)
+    else {
+        panic!("Failed to create settings menu item");
+    };
     let Ok(quit_item) = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>) else {
         panic!("Failed to create quit menu item");
     };
 
-    let Ok(menu) = Menu::with_items(app, &[&quit_item]) else {
+    let Ok(menu) = Menu::with_items(app, &[&settings_item, &quit_item]) else {
         panic!("Failed to create menu");
     };
 
@@ -26,7 +32,9 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
             app.exit(0);
         }
         "settings" => {
-            println!("Settings clicked");
+            if let Err(error) = show_settings_window(app) {
+                println!("Failed to show settings: {error}");
+            }
         }
         _ => {}
     }
