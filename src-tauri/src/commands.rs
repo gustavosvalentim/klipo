@@ -1,9 +1,10 @@
 use std::vec::Vec;
 
+use tauri::image::Image;
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
-use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem};
+use crate::clipboard::{ClipboardEventsEmitter, ClipboardImage, ClipboardItem};
 use crate::input::simulate_paste_input;
 use crate::state::AppState;
 use crate::window::{get_main_window, restore_focused_window};
@@ -64,31 +65,44 @@ pub fn clear(app: AppHandle, state: State<'_, AppState>) {
     }
 }
 
-#[tauri::command]
-pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
-    let Some(item) = state.clipboard.get_by_hash(hash) else {
-        return;
+/// Outcome of a paste decision: whether to continue with the paste flow or abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteOutcome {
+    Continue,
+    Abort,
+}
+
+/// Decide whether and what clipboard content to write for a paste action.
+///
+/// Returns `PasteOutcome::Continue` after successfully writing content to the
+/// clipboard, or `PasteOutcome::Abort` if nothing could be written.
+///
+/// The `write_image` and `write_text` closures allow testing the decision logic
+/// without a real system clipboard.
+pub(crate) fn perform_paste_decision(
+    item: &ClipboardItem,
+    write_image: impl FnOnce(&ClipboardImage) -> bool,
+    write_text: impl FnOnce(&str) -> bool,
+) -> PasteOutcome {
+    let wrote = match item.image.as_ref() {
+        Some(image) => write_image(image) || (!item.text.is_empty() && write_text(&item.text)),
+        None => !item.text.is_empty() && write_text(&item.text),
     };
-
-    if item.text.is_empty() {
-        // Image-only paste is handled by US-003
-        return;
+    if wrote {
+        PasteOutcome::Continue
+    } else {
+        PasteOutcome::Abort
     }
+}
 
-    if app.clipboard().write_text(&item.text).is_err() {
-        println!("Failed to write text to clipboard");
-        return;
-    }
-
-    let _ = state.clipboard.move_to_top_by_hash(hash);
-
-    if let Some(window) = get_main_window(&app) {
+fn perform_paste_flow(app: &AppHandle, state: &AppState) {
+    if let Some(window) = get_main_window(app) {
         if window.hide().is_err() {
             println!("Failed to hide window");
         }
     }
 
-    if restore_focused_window(&state).is_err() {
+    if restore_focused_window(state).is_err() {
         println!("Failed to restore focus");
         return;
     }
@@ -104,6 +118,24 @@ pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
     };
 
     let _ = simulate_paste_input(enigo);
+}
+
+#[tauri::command]
+pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
+    let Some(item) = state.clipboard.get_by_hash(hash) else {
+        return;
+    };
+
+    let write_image = |image: &ClipboardImage| -> bool {
+        let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
+        app.clipboard().write_image(&img).is_ok()
+    };
+    let write_text = |text: &str| -> bool { app.clipboard().write_text(text).is_ok() };
+
+    if perform_paste_decision(&item, write_image, write_text) == PasteOutcome::Continue {
+        let _ = state.clipboard.move_to_top_by_hash(hash);
+        perform_paste_flow(&app, &state);
+    }
 }
 
 #[tauri::command]
@@ -154,10 +186,132 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
             return;
         };
 
-        if !item.text.is_empty() {
+        if let Some(ref image) = item.image {
+            let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
+            if app.clipboard().write_image(&img).is_err() && !item.text.is_empty() {
+                if let Err(e) = app.clipboard().write_text(&item.text) {
+                    println!("Failed to write fallback text to clipboard: {e}");
+                }
+            }
+        } else if !item.text.is_empty() {
             if let Err(e) = app.clipboard().write_text(item.text) {
                 println!("Failed to write text to clipboard: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clipboard::ClipboardImage;
+
+    fn image(byte: u8) -> ClipboardImage {
+        ClipboardImage::from_rgba(vec![byte; 4], 1, 1).unwrap()
+    }
+
+    #[test]
+    fn decision_image_write_success_continues() {
+        let item = ClipboardItem {
+            text: String::new(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| true, |_| false);
+        assert_eq!(outcome, PasteOutcome::Continue);
+    }
+
+    #[test]
+    fn decision_image_write_failure_with_fallback_continues() {
+        let item = ClipboardItem {
+            text: "alt text".into(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| false, |_| true);
+        assert_eq!(outcome, PasteOutcome::Continue);
+    }
+
+    #[test]
+    fn decision_image_write_failure_no_fallback_aborts() {
+        let item = ClipboardItem {
+            text: String::new(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| false, |_| false);
+        assert_eq!(outcome, PasteOutcome::Abort);
+    }
+
+    #[test]
+    fn decision_text_write_success_continues() {
+        let item = ClipboardItem {
+            text: "hello".into(),
+            hash: "text:def".into(),
+            image: None,
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| false, |_| true);
+        assert_eq!(outcome, PasteOutcome::Continue);
+    }
+
+    #[test]
+    fn decision_text_write_failure_aborts() {
+        let item = ClipboardItem {
+            text: "hello".into(),
+            hash: "text:def".into(),
+            image: None,
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| false, |_| false);
+        assert_eq!(outcome, PasteOutcome::Abort);
+    }
+
+    #[test]
+    fn decision_empty_item_aborts() {
+        let item = ClipboardItem {
+            text: String::new(),
+            hash: "empty".into(),
+            image: None,
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(&item, |_| false, |_| false);
+        assert_eq!(outcome, PasteOutcome::Abort);
+    }
+
+    #[test]
+    fn decision_image_success_does_not_fall_back_to_text() {
+        let mut text_written = false;
+        let item = ClipboardItem {
+            text: "fallback".into(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_paste_decision(
+            &item,
+            |_| true,
+            |_| {
+                text_written = true;
+                true
+            },
+        );
+
+        // Image success should not call text write at all
+        assert_eq!(outcome, PasteOutcome::Continue);
+        assert!(
+            !text_written,
+            "text write should not be called when image succeeds"
+        );
     }
 }
