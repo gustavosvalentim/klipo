@@ -72,6 +72,44 @@ pub(crate) enum PasteOutcome {
     Abort,
 }
 
+/// Outcome of writing the new first item to the clipboard after deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstItemReplacementOutcome {
+    Written,
+    NoItem,
+}
+
+/// Write the new first item to the system clipboard after the previous first
+/// item was deleted.
+///
+/// Returns `FirstItemReplacementOutcome::Written` after successfully writing
+/// the item's primary content (or fallback text if image writing fails), or
+/// `FirstItemReplacementOutcome::NoItem` if no item remains or nothing was
+/// written.
+///
+/// The `write_image` and `write_text` closures allow testing the decision logic
+/// without a real system clipboard.
+pub(crate) fn perform_first_item_replacement(
+    item: Option<&ClipboardItem>,
+    write_image: impl FnOnce(&ClipboardImage) -> bool,
+    write_text: impl FnOnce(&str) -> bool,
+) -> FirstItemReplacementOutcome {
+    let Some(item) = item else {
+        return FirstItemReplacementOutcome::NoItem;
+    };
+
+    let wrote = match item.image.as_ref() {
+        Some(image) => write_image(image) || (!item.text.is_empty() && write_text(&item.text)),
+        None => !item.text.is_empty() && write_text(&item.text),
+    };
+
+    if wrote {
+        FirstItemReplacementOutcome::Written
+    } else {
+        FirstItemReplacementOutcome::NoItem
+    }
+}
+
 /// Decide whether and what clipboard content to write for a paste action.
 ///
 /// Returns `PasteOutcome::Continue` after successfully writing content to the
@@ -182,22 +220,24 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
     }
 
     if item_idx == 0 {
-        let Some(item) = state.clipboard.first() else {
-            return;
-        };
-
-        if let Some(ref image) = item.image {
+        let write_image = |image: &ClipboardImage| -> bool {
             let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
-            if app.clipboard().write_image(&img).is_err() && !item.text.is_empty() {
-                if let Err(e) = app.clipboard().write_text(&item.text) {
-                    println!("Failed to write fallback text to clipboard: {e}");
-                }
+            if app.clipboard().write_image(&img).is_ok() {
+                true
+            } else {
+                println!("Failed to write image to clipboard");
+                false
             }
-        } else if !item.text.is_empty() {
-            if let Err(e) = app.clipboard().write_text(item.text) {
-                println!("Failed to write text to clipboard: {e}");
+        };
+        let write_text = |text: &str| -> bool {
+            if app.clipboard().write_text(text).is_ok() {
+                true
+            } else {
+                println!("Failed to write text to clipboard");
+                false
             }
-        }
+        };
+        perform_first_item_replacement(state.clipboard.first().as_ref(), write_image, write_text);
     }
 }
 
@@ -309,6 +349,105 @@ mod tests {
 
         // Image success should not call text write at all
         assert_eq!(outcome, PasteOutcome::Continue);
+        assert!(
+            !text_written,
+            "text write should not be called when image succeeds"
+        );
+    }
+
+    // --- first-item-replacement tests ---
+
+    #[test]
+    fn replacement_image_success_writes_image() {
+        let item = ClipboardItem {
+            text: "fallback".into(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(Some(&item), |_| true, |_| false);
+        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
+    }
+
+    #[test]
+    fn replacement_image_failure_falls_back_to_text() {
+        let item = ClipboardItem {
+            text: "alt text".into(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| true);
+        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
+    }
+
+    #[test]
+    fn replacement_image_failure_no_fallback_returns_no_item() {
+        let item = ClipboardItem {
+            text: String::new(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| false);
+        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
+    }
+
+    #[test]
+    fn replacement_text_success_writes_text() {
+        let item = ClipboardItem {
+            text: "hello".into(),
+            hash: "text:def".into(),
+            image: None,
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| true);
+        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
+    }
+
+    #[test]
+    fn replacement_text_failure_returns_no_item() {
+        let item = ClipboardItem {
+            text: "hello".into(),
+            hash: "text:def".into(),
+            image: None,
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| false);
+        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
+    }
+
+    #[test]
+    fn replacement_no_item_returns_no_item() {
+        let outcome = perform_first_item_replacement(None, |_| true, |_| true);
+        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
+    }
+
+    #[test]
+    fn replacement_image_success_does_not_fall_back_to_text() {
+        let mut text_written = false;
+        let item = ClipboardItem {
+            text: "fallback".into(),
+            hash: "image:abc".into(),
+            image: Some(image(0x42)),
+            preview: None,
+        };
+
+        let outcome = perform_first_item_replacement(
+            Some(&item),
+            |_| true,
+            |_| {
+                text_written = true;
+                true
+            },
+        );
+
+        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
         assert!(
             !text_written,
             "text write should not be called when image succeeds"
