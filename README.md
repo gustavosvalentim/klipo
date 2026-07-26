@@ -14,12 +14,13 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 ## ✨ Features
 
-- Text clipboard history.
+- Text and image clipboard history.
+- Compact image thumbnails in the picker, with full-resolution restore on paste.
 - Global shortcut to open the picker at the cursor position.
 - Configurable keyboard shortcuts, saved between app launches.
 - Floating, always-on-top clipboard menu.
 - Tray icon with Settings so the app can stay resident in the background.
-- In-memory history capped at 120 text items.
+- In-memory history capped at 120 text and image items.
 
 ## ⌨️ Usage
 
@@ -31,19 +32,19 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 Open **Settings…** from the tray menu to record and save replacement key combinations. Only the Open Klipo shortcut is global; navigation, paste, and delete shortcuts apply while the picker is focused. Escape is fixed and cannot be changed.
 
-Klipo currently stores text only. Image clipboard support is not implemented yet, and history is not persisted across app restarts.
+Klipo captures text and images in the current session. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History is not persisted across app restarts, and full-resolution image data is kept in memory only — it is never written to disk, logs, or the network.
 
 ## 🗺️ Roadmap
 
 The following work is planned to evolve Klipo from a macOS text clipboard utility into a cross-platform clipboard manager.
 
-- [ ] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
+- [x] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
 - [ ] **Persistent history between sessions** — Save clipboard history to an application-data store, restore it at launch, and ensure clearing or deleting an item updates the stored history. This will include sensible limits for retained items and stored data size.
 - [ ] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating log files so issues can be investigated after Klipo has been running.
 - [ ] **Linux support** — Replace macOS-specific window-focus and paste behavior with Linux-compatible implementations, verify clipboard monitoring and global shortcuts across the supported desktop environments, and provide Linux build/install artifacts.
 - [ ] **Windows support** — Implement Windows focus restoration and paste behavior, validate the picker, tray, global shortcut, and clipboard monitoring on Windows, and provide Windows release artifacts.
 
-Cross-platform support depends on platform-specific focus restoration and input simulation: the current paste flow only fully supports macOS.
+Cross-platform support depends on platform-specific focus restoration and input simulation: the current paste flow only fully supports macOS. The image history model and its commands are platform-neutral and share the same content model and command contract across desktop targets. On Linux and Windows, focus restoration, paste integration, and clipboard-change monitoring are not yet implemented or validated. On Linux specifically, clipboard monitoring relies on X11; native Wayland monitoring is not covered.
 
 ## 📦 Install on macOS
 
