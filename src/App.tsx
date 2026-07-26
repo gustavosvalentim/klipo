@@ -9,6 +9,7 @@ import "./App.css";
 type ClipboardItem = {
 	hash: string;
 	text: string;
+	preview?: string;
 };
 
 type Clipboard = ClipboardItem[];
@@ -72,7 +73,7 @@ function App() {
 	const [selectedItem, setSelectedItem] = useState<number | null>(null);
 	const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
 
-  const historyRef = useRef<HTMLDivElement>(null);
+	const historyRef = useRef<HTMLDivElement>(null);
 
 	const hide = useCallback(() => invoke("close"), []);
 
@@ -93,16 +94,16 @@ function App() {
 		}
 	}, []);
 
-	const pasteFromSelection = useCallback(async (text: string) => {
+	const pasteFromSelection = useCallback(async (hash: string) => {
 		try {
-			await invoke("paste", { text });
+			await invoke("paste", { hash });
 		} catch (error) {
 			console.error("Failed to paste from selection", error);
 		}
 	}, []);
 
-	const deleteItem = useCallback(async (text: string) => {
-		await invoke("delete_item", { text });
+	const deleteItem = useCallback(async (hash: string) => {
+		await invoke("delete_item", { hash });
 		setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
 	}, []);
 
@@ -112,10 +113,11 @@ function App() {
 
 	const clipboardMenuItems = useMemo(
 		() =>
-			clipboard.map((item, idx) => ({
-				label: `${idx}. ${item.text}`,
+			clipboard.map((item) => ({
+				label: item.text || `Image ${item.hash.slice(0, 8)}`,
 				key: item.hash,
-				onClick: () => pasteFromSelection(item.text),
+				onClick: () => pasteFromSelection(item.hash),
+				preview: item.preview,
 			})),
 		[clipboard, pasteFromSelection],
 	);
@@ -137,25 +139,27 @@ function App() {
 			switch (pressedShortcut) {
 				case shortcuts.moveSelectionUp:
 					event.preventDefault();
-          
-          newSelectedItem = selectedItem !== null && selectedItem > 0 ?
-            selectedItem - 1 :
-            clipboard.length - 1;
+
+					newSelectedItem =
+						selectedItem !== null && selectedItem > 0
+							? selectedItem - 1
+							: clipboard.length - 1;
 
 					break;
 				case shortcuts.moveSelectionDown:
 					event.preventDefault();
 
-          newSelectedItem = selectedItem !== null && selectedItem < clipboard.length - 1 ?
-            selectedItem + 1 :
-            0;
+					newSelectedItem =
+						selectedItem !== null && selectedItem < clipboard.length - 1
+							? selectedItem + 1
+							: 0;
 
 					break;
 				case shortcuts.pasteSelectedItem: {
 					event.preventDefault();
 
 					if (selectedItem !== null && isValidItem(selectedItem)) {
-						pasteFromSelection(clipboard[selectedItem].text);
+						pasteFromSelection(clipboard[selectedItem].hash);
 					}
 
 					return;
@@ -164,7 +168,7 @@ function App() {
 					event.preventDefault();
 
 					if (selectedItem !== null && isValidItem(selectedItem)) {
-						deleteItem(clipboard[selectedItem].text);
+						deleteItem(clipboard[selectedItem].hash);
 					}
 
 					break;
@@ -172,11 +176,11 @@ function App() {
 					break;
 			}
 
-      if (newSelectedItem !== null && newSelectedItem !== selectedItem) {
-        historyRef.current?.children[newSelectedItem]?.scrollIntoView({
-          block: "nearest",
-        });
-      }
+			if (newSelectedItem !== null && newSelectedItem !== selectedItem) {
+				historyRef.current?.children[newSelectedItem]?.scrollIntoView({
+					block: "nearest",
+				});
+			}
 
 			setSelectedItem(newSelectedItem);
 		},

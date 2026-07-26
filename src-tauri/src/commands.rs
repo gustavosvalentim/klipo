@@ -65,17 +65,22 @@ pub fn clear(app: AppHandle, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-pub fn paste(app: AppHandle, state: State<'_, AppState>, text: &str) {
-    if !state.clipboard.exists(text) {
+pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
+    let Some(item) = state.clipboard.get_by_hash(hash) else {
+        return;
+    };
+
+    if item.text.is_empty() {
+        // Image-only paste is handled by US-003
         return;
     }
 
-    if app.clipboard().write_text(text).is_err() {
+    if app.clipboard().write_text(&item.text).is_err() {
         println!("Failed to write text to clipboard");
         return;
     }
 
-    let _ = state.clipboard.move_to_top(text);
+    let _ = state.clipboard.move_to_top_by_hash(hash);
 
     if let Some(window) = get_main_window(&app) {
         if window.hide().is_err() {
@@ -130,12 +135,12 @@ pub fn close(app: AppHandle, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-pub fn delete_item(app: AppHandle, state: State<'_, AppState>, text: &str) {
-    if text.is_empty() {
+pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
+    if hash.is_empty() {
         return;
     }
 
-    let Ok(item_idx) = state.clipboard.delete(text) else {
+    let Ok(item_idx) = state.clipboard.delete_by_hash(hash) else {
         println!("Failed to delete item from clipboard history");
         return;
     };
@@ -149,8 +154,10 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, text: &str) {
             return;
         };
 
-        if let Err(e) = app.clipboard().write_text(item.text) {
-            println!("Failed to write text to clipboard: {e}");
+        if !item.text.is_empty() {
+            if let Err(e) = app.clipboard().write_text(item.text) {
+                println!("Failed to write text to clipboard: {e}");
+            }
         }
     }
 }

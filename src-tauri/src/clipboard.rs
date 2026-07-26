@@ -11,6 +11,8 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use crate::state::AppState;
 use crate::window::get_focused_window;
 
+const THUMBNAIL_MAX_SIZE: u32 = 20;
+
 const MAX_ITEMS: usize = 120;
 
 #[derive(Debug)]
@@ -38,6 +40,49 @@ impl ClipboardStore {
         Self {
             items: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn get_by_hash(&self, hash: &str) -> Option<ClipboardItem> {
+        let guard = self.items.lock().ok()?;
+        guard.iter().find(|item| item.hash == hash).cloned()
+    }
+
+    #[allow(dead_code)]
+    pub fn exists_by_hash(&self, hash: &str) -> bool {
+        let Ok(guard) = self.items.lock() else {
+            return false;
+        };
+        guard.iter().any(|item| item.hash == hash)
+    }
+
+    pub fn delete_by_hash(&self, hash: &str) -> Result<usize, ClipboardError> {
+        let mut history = match self.items.lock() {
+            Ok(history) => history,
+            Err(_) => return Err(ClipboardError::PoisonError),
+        };
+
+        let Some(idx) = history.iter().position(|item| item.hash == hash) else {
+            return Err(ClipboardError::ItemNotFound);
+        };
+
+        history.remove(idx);
+
+        Ok(idx)
+    }
+
+    pub fn move_to_top_by_hash(&self, hash: &str) -> Result<(), ClipboardError> {
+        let mut guard = self.items.lock().map_err(|_| ClipboardError::PoisonError)?;
+
+        let item_idx = guard
+            .iter()
+            .position(|item| item.hash == hash)
+            .ok_or(ClipboardError::ItemNotFound)?;
+
+        let item = guard.remove(item_idx);
+
+        guard.insert(0, item);
+
+        Ok(())
     }
 
     fn hash_text(text: &str) -> String {
@@ -90,8 +135,9 @@ impl ClipboardStore {
 
         if let Some(item_idx) = history.iter().position(|item| item.hash == hash) {
             let mut item = history.remove(item_idx);
-            if image.is_some() {
-                item.image = image;
+            if let Some(image) = image {
+                item.image = Some(image);
+                item.preview = generate_preview(item.image.as_ref().unwrap());
             }
             if let Some(text) = text {
                 item.text = text;
@@ -104,12 +150,15 @@ impl ClipboardStore {
             history.pop();
         }
 
+        let preview = image.as_ref().and_then(generate_preview);
+
         history.insert(
             0,
             ClipboardItem {
                 text: text.unwrap_or_default(),
                 hash,
                 image,
+                preview,
             },
         );
         true
@@ -138,48 +187,6 @@ impl ClipboardStore {
         let guard = self.items.lock().map_err(|_| ClipboardError::PoisonError)?;
 
         Ok(guard.clone())
-    }
-
-    pub fn exists(&self, text: &str) -> bool {
-        let hash = Self::hash_text(text);
-        let Ok(guard) = self.items.lock() else {
-            return false;
-        };
-
-        guard.iter().any(|item| item.hash == hash)
-    }
-
-    pub fn delete(&self, text: &str) -> Result<usize, ClipboardError> {
-        let hash = Self::hash_text(text);
-        let mut history = match self.items.lock() {
-            Ok(history) => history,
-            Err(_) => return Err(ClipboardError::PoisonError),
-        };
-
-        let Some(idx) = history.iter().position(|item| item.hash == hash) else {
-            return Err(ClipboardError::ItemNotFound);
-        };
-
-        history.remove(idx);
-
-        Ok(idx)
-    }
-
-    pub fn move_to_top(&self, text: &str) -> Result<(), ClipboardError> {
-        let hash = Self::hash_text(text);
-
-        let mut guard = self.items.lock().map_err(|_| ClipboardError::PoisonError)?;
-
-        let item_idx = guard
-            .iter()
-            .position(|item| item.hash == hash)
-            .ok_or(ClipboardError::ItemNotFound)?;
-
-        let item = guard.remove(item_idx);
-
-        guard.insert(0, item);
-
-        Ok(())
     }
 }
 
@@ -212,6 +219,8 @@ pub struct ClipboardItem {
     pub hash: String,
     #[serde(skip)]
     pub image: Option<ClipboardImage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 pub struct ClipboardEventsListener {
@@ -278,6 +287,49 @@ impl ClipboardHandler for ClipboardEventsHandler {
     }
 }
 
+fn generate_preview(image: &ClipboardImage) -> Option<String> {
+    let (new_w, new_h) = if image.width > THUMBNAIL_MAX_SIZE || image.height > THUMBNAIL_MAX_SIZE {
+        if image.width > image.height {
+            let h = (image.height * THUMBNAIL_MAX_SIZE).max(1) / image.width;
+            (THUMBNAIL_MAX_SIZE, h.max(1))
+        } else if image.height > image.width {
+            let w = (image.width * THUMBNAIL_MAX_SIZE).max(1) / image.height;
+            (w.max(1), THUMBNAIL_MAX_SIZE)
+        } else {
+            (THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE)
+        }
+    } else {
+        (image.width, image.height)
+    };
+
+    let mut preview_data = vec![0u8; (new_w * new_h * 4) as usize];
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let src_x = (x * image.width) / new_w;
+            let src_y = (y * image.height) / new_h;
+            let src_idx = ((src_y * image.width + src_x) * 4) as usize;
+            let dst_idx = ((y * new_w + x) * 4) as usize;
+            preview_data[dst_idx..dst_idx + 4].copy_from_slice(&image.rgba[src_idx..src_idx + 4]);
+        }
+    }
+
+    let mut png_bytes = Vec::new();
+    {
+        use image::ImageFormat;
+        use image::RgbaImage;
+        use std::io::Cursor;
+
+        let img = RgbaImage::from_raw(new_w, new_h, preview_data)?;
+        img.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
+            .ok()?;
+    }
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+    Some(format!("data:image/png;base64,{b64}"))
+}
+
 const CLIPBOARD_CHANGED_EVENT: &str = "clipboard-changed";
 
 pub trait ClipboardEventsEmitter {
@@ -309,6 +361,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "hello");
         assert!(items[0].image.is_none());
+        assert!(items[0].preview.is_none());
         assert!(items[0].hash.starts_with("text:"));
     }
 
@@ -390,5 +443,86 @@ mod tests {
         assert!(!store.add_content(None, Some(String::new())));
         assert!(ClipboardImage::from_rgba(vec![0; 3], 1, 1).is_none());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn generates_preview_for_image_items() {
+        let store = ClipboardStore::new();
+
+        assert!(store.add_content(Some(image(4, 2, 0xab)), None));
+
+        let item = store.first().unwrap();
+        let preview = item.preview.expect("image items should have a preview");
+        assert!(preview.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn no_preview_for_text_items() {
+        let store = ClipboardStore::new();
+
+        assert!(store.add_text("hello".into()));
+
+        let item = store.first().unwrap();
+        assert!(item.preview.is_none());
+    }
+
+    #[test]
+    fn hash_based_get_and_exists() {
+        let store = ClipboardStore::new();
+        let hash = {
+            assert!(store.add_text("item".into()));
+            store.first().unwrap().hash.clone()
+        };
+
+        assert!(store.exists_by_hash(&hash));
+        assert!(!store.exists_by_hash("nonexistent"));
+
+        let item = store.get_by_hash(&hash);
+        assert!(item.is_some());
+        assert_eq!(item.unwrap().text, "item");
+    }
+
+    #[test]
+    fn hash_based_delete() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("first".into()));
+        assert!(store.add_text("second".into()));
+        let second_hash = store.first().unwrap().hash.clone();
+
+        assert_eq!(store.delete_by_hash(&second_hash).unwrap(), 0);
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list().unwrap()[0].text, "first");
+    }
+
+    #[test]
+    fn hash_based_delete_nonexistent() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("item".into()));
+
+        assert!(store.delete_by_hash("text:nonexistent").is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn hash_based_move_to_top() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("first".into()));
+        assert!(store.add_text("second".into()));
+        let first_hash = {
+            let items = store.list().unwrap();
+            items[1].hash.clone()
+        };
+
+        assert!(store.move_to_top_by_hash(&first_hash).is_ok());
+        assert_eq!(store.list().unwrap()[0].text, "first");
+    }
+
+    #[test]
+    fn hash_based_move_to_top_nonexistent() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("item".into()));
+
+        assert!(store.move_to_top_by_hash("text:nonexistent").is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 }
