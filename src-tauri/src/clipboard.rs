@@ -587,4 +587,17 @@ mod tests {
         let img = new_first.image.unwrap();
         assert_eq!(img.rgba, vec![0x77; 3 * 3 * 4]);
     }
+
+    #[test]
+    fn clears_all_text_and_image_entries() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("hello".into()));
+        assert!(store.add_image(image(2, 2, 0x11), None));
+        assert!(store.add_image(image(1, 1, 0x22), Some("mixed".into())));
+        assert_eq!(store.list().unwrap().len(), 3);
+
+        assert!(store.clear().is_ok());
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.first().is_none());
+    }
 }
