@@ -517,4 +517,74 @@ mod tests {
         assert!(store.move_to_top_by_hash("text:nonexistent").is_err());
         assert_eq!(store.list().unwrap().len(), 1);
     }
+
+    #[test]
+    fn paste_retrieves_image_item_with_full_resolution_data() {
+        let store = ClipboardStore::new();
+        let expected = image(4, 3, 0x42);
+
+        assert!(store.add_image(expected.clone(), None));
+
+        let item = store.first().unwrap();
+        let retrieved = store.get_by_hash(&item.hash).unwrap();
+
+        assert!(retrieved.image.is_some());
+        let img = retrieved.image.unwrap();
+        assert_eq!(img.rgba, expected.rgba);
+        assert_eq!(img.width, 4);
+        assert_eq!(img.height, 3);
+    }
+
+    #[test]
+    fn paste_retrieves_mixed_item_with_image_and_fallback_text() {
+        let store = ClipboardStore::new();
+
+        assert!(store.add_image(image(2, 2, 0xff), Some("alt text".into())));
+
+        let item = store.first().unwrap();
+        let retrieved = store.get_by_hash(&item.hash).unwrap();
+
+        assert!(retrieved.image.is_some());
+        assert_eq!(retrieved.text, "alt text");
+    }
+
+    #[test]
+    fn paste_stale_hash_returns_none() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("existing".into()));
+
+        assert!(store.get_by_hash("text:nonexistent").is_none());
+        assert!(store.get_by_hash("image:nonexistent").is_none());
+    }
+
+    #[test]
+    fn delete_by_hash_removes_exact_item_for_image() {
+        let store = ClipboardStore::new();
+        assert!(store.add_image(image(1, 1, 1), None));
+        assert!(store.add_text("other".into()));
+
+        let img_hash = store.list().unwrap()[1].hash.clone();
+
+        assert!(store.delete_by_hash(&img_hash).is_ok());
+        let items = store.list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "other");
+    }
+
+    #[test]
+    fn new_first_item_after_delete_has_image_when_applicable() {
+        let store = ClipboardStore::new();
+        // Add image first (older), then text (newer, index 0).
+        assert!(store.add_image(image(3, 3, 0x77), None));
+        assert!(store.add_text("delete-me".into()));
+
+        // Delete the text item at index 0 so the image becomes first.
+        let text_hash = store.first().unwrap().hash.clone();
+        assert!(store.delete_by_hash(&text_hash).is_ok());
+
+        let new_first = store.first().unwrap();
+        assert!(new_first.image.is_some());
+        let img = new_first.image.unwrap();
+        assert_eq!(img.rgba, vec![0x77; 3 * 3 * 4]);
+    }
 }
