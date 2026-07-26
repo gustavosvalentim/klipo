@@ -2054,8 +2054,10 @@ dependencies = [
 name = "klipo"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clipboard-master",
  "enigo",
+ "image",
  "md-5",
  "objc2-app-kit",
  "serde",

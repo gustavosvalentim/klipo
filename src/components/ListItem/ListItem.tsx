@@ -2,6 +2,7 @@ export type ListItemProps = {
 	label: string;
 	onClick?: () => void;
 	active?: boolean;
+	preview?: string;
 };
 
 type ListItemButtonProps = React.PropsWithChildren & {
@@ -38,6 +39,7 @@ export const ListItem = ({
 	label,
 	onClick,
 	active,
+	preview,
 	...props
 }: ListItemProps) => (
 	<div className="flex w-full items-center my-1">
@@ -47,9 +49,17 @@ export const ListItem = ({
 			active={active}
 			{...props}
 		>
-			<span className="block text-sm min-w-0 text-nowrap whitespace-nowrap text-ellipsis overflow-hidden">
-				{label}
-			</span>
+			{preview ? (
+				<img
+					src={preview}
+					alt={label}
+					className="inline-block w-[20px] h-[20px] object-contain align-middle"
+				/>
+			) : (
+				<span className="block text-sm min-w-0 text-nowrap whitespace-nowrap text-ellipsis overflow-hidden">
+					{label}
+				</span>
+			)}
 		</ListItemButton>
 	</div>
 );
