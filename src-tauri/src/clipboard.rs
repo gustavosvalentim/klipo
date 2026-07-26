@@ -302,25 +302,17 @@ fn generate_preview(image: &ClipboardImage) -> Option<String> {
         (image.width, image.height)
     };
 
-    let mut preview_data = vec![0u8; (new_w * new_h * 4) as usize];
-    for y in 0..new_h {
-        for x in 0..new_w {
-            let src_x = (x * image.width) / new_w;
-            let src_y = (y * image.height) / new_h;
-            let src_idx = ((src_y * image.width + src_x) * 4) as usize;
-            let dst_idx = ((y * new_w + x) * 4) as usize;
-            preview_data[dst_idx..dst_idx + 4].copy_from_slice(&image.rgba[src_idx..src_idx + 4]);
-        }
-    }
-
     let mut png_bytes = Vec::new();
     {
+        use image::imageops::FilterType;
         use image::ImageFormat;
         use image::RgbaImage;
         use std::io::Cursor;
 
-        let img = RgbaImage::from_raw(new_w, new_h, preview_data)?;
-        img.write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
+        let img = RgbaImage::from_raw(image.width, image.height, image.rgba.clone())?;
+        let thumb = image::imageops::resize(&img, new_w, new_h, FilterType::Nearest);
+        thumb
+            .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
             .ok()?;
     }
 
