@@ -135,6 +135,6 @@ button {
 	min-height: 0;
 	flex: 1;
 	margin-top: 4px;
-	overflow-y: scroll;
+	overflow-y: auto;
 	overflow-x: hidden;
 }
