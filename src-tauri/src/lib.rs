@@ -4,6 +4,7 @@ mod input;
 mod settings;
 mod shortcuts;
 mod state;
+mod storage;
 mod tray;
 mod window;
 
