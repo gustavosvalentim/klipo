@@ -161,7 +161,7 @@ impl ClipboardStore {
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
-        let updated_at = next_updated_at(&connection)?;
+        let updated_at = now_ns();
         let changed = connection.execute(
             "UPDATE clipboard_items SET updated_at = ?1 WHERE hash = ?2",
             params![updated_at, hash],
@@ -249,7 +249,7 @@ impl ClipboardStore {
             None => None,
         };
         let transaction = connection.transaction()?;
-        let updated_at = next_updated_at(&transaction)?;
+        let updated_at = now_ns();
         let (width, height) = match image.as_ref() {
             Some(image) => (Some(image.width), Some(image.height)),
             None => (None, None),
@@ -423,16 +423,6 @@ fn now_ns() -> i64 {
         .as_nanos()
         .try_into()
         .unwrap_or(i64::MAX)
-}
-
-fn next_updated_at(connection: &Connection) -> rusqlite::Result<i64> {
-    let now = now_ns();
-    let latest: i64 = connection.query_row(
-        "SELECT COALESCE(MAX(updated_at), 0) FROM clipboard_items",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(now.max(latest.saturating_add(1)))
 }
 
 fn migrate_sort_order(connection: &mut Connection) -> rusqlite::Result<()> {
