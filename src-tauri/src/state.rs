@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::clipboard::ClipboardStore;
@@ -12,12 +13,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        Self {
-            clipboard: ClipboardStore::new(),
+    pub fn new(database_path: impl AsRef<Path>) -> Result<Self, crate::clipboard::ClipboardError> {
+        Ok(Self {
+            clipboard: ClipboardStore::open(database_path)?,
             input: InputState::new(),
             focused_window_pid: Mutex::new(None),
             shortcuts: Mutex::new(ShortcutSettings::default()),
-        }
+        })
     }
 }

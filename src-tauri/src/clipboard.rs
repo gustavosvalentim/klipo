@@ -1,6 +1,8 @@
 use md5::{Digest, Md5};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
@@ -17,6 +19,7 @@ const MAX_ITEMS: usize = 120;
 
 #[derive(Debug)]
 pub enum ClipboardError {
+    Database(rusqlite::Error),
     PoisonError,
     ItemNotFound,
 }
@@ -24,63 +27,118 @@ pub enum ClipboardError {
 impl std::fmt::Display for ClipboardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClipboardError::PoisonError => write!(f, "Clipboard poisoned"),
+            ClipboardError::Database(error) => write!(f, "Clipboard database error: {error}"),
+            ClipboardError::PoisonError => write!(f, "Clipboard database lock poisoned"),
             ClipboardError::ItemNotFound => write!(f, "Item not found"),
         }
     }
 }
 
-#[derive(Debug, Serialize)]
+impl std::error::Error for ClipboardError {}
+
+impl From<rusqlite::Error> for ClipboardError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug)]
 pub struct ClipboardStore {
-    items: Mutex<Vec<ClipboardItem>>,
+    connection: Mutex<Connection>,
 }
 
 impl ClipboardStore {
-    pub fn new() -> Self {
-        Self {
-            items: Mutex::new(Vec::new()),
-        }
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, ClipboardError> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    fn from_connection(connection: Connection) -> Result<Self, ClipboardError> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS clipboard_items (
+                id INTEGER PRIMARY KEY,
+                hash TEXT NOT NULL UNIQUE,
+                text TEXT NOT NULL,
+                image_rgba BLOB,
+                image_width INTEGER,
+                image_height INTEGER,
+                preview TEXT,
+                sort_order INTEGER NOT NULL
+            );",
+        )?;
+
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
     }
 
     pub fn get_by_hash(&self, hash: &str) -> Option<ClipboardItem> {
-        let guard = self.items.lock().ok()?;
-        guard.iter().find(|item| item.hash == hash).cloned()
+        self.try_get_by_hash(hash).ok().flatten()
+    }
+
+    fn try_get_by_hash(&self, hash: &str) -> Result<Option<ClipboardItem>, ClipboardError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let mut statement = connection.prepare(
+            "SELECT text, hash, image_rgba, image_width, image_height, preview
+             FROM clipboard_items WHERE hash = ?1",
+        )?;
+
+        Ok(statement.query_row([hash], row_to_item).optional()?)
     }
 
     #[allow(dead_code)]
     pub fn exists_by_hash(&self, hash: &str) -> bool {
-        let Ok(guard) = self.items.lock() else {
-            return false;
-        };
-        guard.iter().any(|item| item.hash == hash)
+        self.get_by_hash(hash).is_some()
     }
 
     pub fn delete_by_hash(&self, hash: &str) -> Result<usize, ClipboardError> {
-        let mut history = match self.items.lock() {
-            Ok(history) => history,
-            Err(_) => return Err(ClipboardError::PoisonError),
-        };
-
-        let Some(idx) = history.iter().position(|item| item.hash == hash) else {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let transaction = connection.transaction()?;
+        let sort_order: Option<i64> = transaction
+            .query_row(
+                "SELECT sort_order FROM clipboard_items WHERE hash = ?1",
+                [hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(sort_order) = sort_order else {
             return Err(ClipboardError::ItemNotFound);
         };
+        let index = transaction.query_row(
+            "SELECT COUNT(*) FROM clipboard_items WHERE sort_order > ?1",
+            [sort_order],
+            |row| row.get::<_, usize>(0),
+        )?;
+        transaction.execute("DELETE FROM clipboard_items WHERE hash = ?1", [hash])?;
+        transaction.commit()?;
 
-        history.remove(idx);
-
-        Ok(idx)
+        Ok(index)
     }
 
     pub fn move_to_top_by_hash(&self, hash: &str) -> Result<(), ClipboardError> {
-        let mut guard = self.items.lock().map_err(|_| ClipboardError::PoisonError)?;
-
-        let item_idx = guard
-            .iter()
-            .position(|item| item.hash == hash)
-            .ok_or(ClipboardError::ItemNotFound)?;
-
-        let item = guard.remove(item_idx);
-
-        guard.insert(0, item);
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let changed = connection.execute(
+            "UPDATE clipboard_items
+             SET sort_order = (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM clipboard_items)
+             WHERE hash = ?1",
+            [hash],
+        )?;
+        if changed == 0 {
+            return Err(ClipboardError::ItemNotFound);
+        }
 
         Ok(())
     }
@@ -111,83 +169,187 @@ impl ClipboardStore {
         format!("image:{hex}")
     }
 
+    #[cfg(test)]
     pub fn add_text(&self, text: String) -> bool {
-        self.add_content(None, Some(text))
+        self.try_add_text(text).unwrap_or(false)
     }
 
+    pub fn try_add_text(&self, text: String) -> Result<bool, ClipboardError> {
+        self.try_add_content(None, Some(text))
+    }
+
+    #[cfg(test)]
     pub fn add_image(&self, image: ClipboardImage, text: Option<String>) -> bool {
-        self.add_content(Some(image), text)
+        self.try_add_image(image, text).unwrap_or(false)
     }
 
+    pub fn try_add_image(
+        &self,
+        image: ClipboardImage,
+        text: Option<String>,
+    ) -> Result<bool, ClipboardError> {
+        self.try_add_content(Some(image), text)
+    }
+
+    #[cfg(test)]
     pub fn add_content(&self, image: Option<ClipboardImage>, text: Option<String>) -> bool {
+        self.try_add_content(image, text).unwrap_or(false)
+    }
+
+    pub fn try_add_content(
+        &self,
+        image: Option<ClipboardImage>,
+        text: Option<String>,
+    ) -> Result<bool, ClipboardError> {
         let text = text.filter(|text| !text.is_empty());
         let hash = match image.as_ref() {
             Some(image) => Self::hash_image(image),
             None => match text.as_deref() {
                 Some(text) => Self::hash_text(text),
-                None => return false,
+                None => return Ok(false),
             },
         };
-        let mut history = match self.items.lock() {
-            Ok(history) => history,
-            Err(_) => return false,
-        };
-
-        if let Some(item_idx) = history.iter().position(|item| item.hash == hash) {
-            let mut item = history.remove(item_idx);
-            if let Some(image) = image {
-                item.image = Some(image);
-                item.preview = generate_preview(item.image.as_ref().unwrap());
-            }
-            if let Some(text) = text {
-                item.text = text;
-            }
-            history.insert(0, item);
-            return true;
-        }
-
-        if history.len() >= MAX_ITEMS {
-            history.pop();
-        }
-
         let preview = image.as_ref().and_then(generate_preview);
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let transaction = connection.transaction()?;
+        let exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clipboard_items WHERE hash = ?1)",
+            [&hash],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let next_order = next_sort_order(&transaction)?;
 
-        history.insert(
-            0,
-            ClipboardItem {
-                text: text.unwrap_or_default(),
-                hash,
-                image,
-                preview,
-            },
-        );
-        true
+        if exists {
+            match image.as_ref() {
+                Some(image) => {
+                    if let Some(text) = text.as_deref() {
+                        transaction.execute(
+                            "UPDATE clipboard_items SET text = ?1, image_rgba = ?2,
+                             image_width = ?3, image_height = ?4, preview = ?5, sort_order = ?6
+                             WHERE hash = ?7",
+                            params![
+                                text,
+                                &image.rgba,
+                                image.width,
+                                image.height,
+                                preview,
+                                next_order,
+                                hash
+                            ],
+                        )?;
+                    } else {
+                        transaction.execute(
+                            "UPDATE clipboard_items SET image_rgba = ?1, image_width = ?2,
+                             image_height = ?3, preview = ?4, sort_order = ?5 WHERE hash = ?6",
+                            params![
+                                &image.rgba,
+                                image.width,
+                                image.height,
+                                preview,
+                                next_order,
+                                hash
+                            ],
+                        )?;
+                    }
+                }
+                None => {
+                    transaction.execute(
+                        "UPDATE clipboard_items SET text = ?1, sort_order = ?2 WHERE hash = ?3",
+                        params![text.as_deref().unwrap_or_default(), next_order, hash],
+                    )?;
+                }
+            }
+        } else {
+            let (rgba, width, height) = match image.as_ref() {
+                Some(image) => (
+                    Some(image.rgba.as_slice()),
+                    Some(image.width),
+                    Some(image.height),
+                ),
+                None => (None, None, None),
+            };
+            transaction.execute(
+                "INSERT INTO clipboard_items
+                 (hash, text, image_rgba, image_width, image_height, preview, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hash,
+                    text.as_deref().unwrap_or_default(),
+                    rgba,
+                    width,
+                    height,
+                    preview,
+                    next_order
+                ],
+            )?;
+        }
+
+        transaction.execute(
+            "DELETE FROM clipboard_items WHERE id IN (
+                SELECT id FROM clipboard_items ORDER BY sort_order DESC LIMIT -1 OFFSET ?1
+            )",
+            [MAX_ITEMS],
+        )?;
+        transaction.commit()?;
+
+        Ok(true)
     }
 
     pub fn clear(&self) -> Result<(), ClipboardError> {
-        self.items
+        self.connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?
-            .clear();
-
+            .execute("DELETE FROM clipboard_items", [])?;
         Ok(())
     }
 
     pub fn first(&self) -> Option<ClipboardItem> {
-        let guard = self.items.lock().ok()?;
-
-        if guard.is_empty() {
-            None
-        } else {
-            Some(guard[0].clone())
-        }
+        self.list().ok()?.into_iter().next()
     }
 
     pub fn list(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
-        let guard = self.items.lock().map_err(|_| ClipboardError::PoisonError)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let mut statement = connection.prepare(
+            "SELECT text, hash, image_rgba, image_width, image_height, preview
+             FROM clipboard_items ORDER BY sort_order DESC",
+        )?;
+        let items = statement
+            .query_map([], row_to_item)?
+            .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(guard.clone())
+        Ok(items)
     }
+}
+
+fn next_sort_order(transaction: &Transaction<'_>) -> rusqlite::Result<i64> {
+    transaction.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM clipboard_items",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
+    let rgba: Option<Vec<u8>> = row.get(2)?;
+    let width: Option<u32> = row.get(3)?;
+    let height: Option<u32> = row.get(4)?;
+    let image = match (rgba, width, height) {
+        (Some(rgba), Some(width), Some(height)) => ClipboardImage::from_rgba(rgba, width, height),
+        _ => None,
+    };
+
+    Ok(ClipboardItem {
+        text: row.get(0)?,
+        hash: row.get(1)?,
+        image,
+        preview: row.get(5)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -270,12 +432,19 @@ impl ClipboardHandler for ClipboardEventsHandler {
         let store = &state.clipboard;
 
         let accepted = match image {
-            Some(image) => store.add_image(image, text),
-            None => text.map(|text| store.add_text(text)).unwrap_or(false),
+            Some(image) => store.try_add_image(image, text),
+            None => match text {
+                Some(text) => store.try_add_text(text),
+                None => Ok(false),
+            },
         };
 
-        if accepted {
-            let _ = self.app.emit_clipboard_changed();
+        match accepted {
+            Ok(true) => {
+                let _ = self.app.emit_clipboard_changed();
+            }
+            Ok(false) => {}
+            Err(error) => println!("Failed to store clipboard item: {error}"),
         }
 
         CallbackResult::Next
@@ -599,5 +768,47 @@ mod tests {
         assert!(store.clear().is_ok());
         assert!(store.list().unwrap().is_empty());
         assert!(store.first().is_none());
+    }
+
+    #[test]
+    fn persists_history_deletions_and_clear_between_connections() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("klipo-clipboard-{unique}.sqlite3"));
+
+        let (image_hash, text_hash) = {
+            let store = ClipboardStore::open(&path).unwrap();
+            assert!(store.add_text("persistent text".into()));
+            let text_hash = store.first().unwrap().hash;
+            assert!(store.add_image(image(2, 1, 0x42), Some("fallback".into())));
+            (store.first().unwrap().hash, text_hash)
+        };
+
+        {
+            let store = ClipboardStore::open(&path).unwrap();
+            let items = store.list().unwrap();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].image.as_ref().unwrap().rgba, vec![0x42; 8]);
+            store.move_to_top_by_hash(&text_hash).unwrap();
+        }
+
+        {
+            let store = ClipboardStore::open(&path).unwrap();
+            assert_eq!(store.first().unwrap().hash, text_hash);
+            store.delete_by_hash(&image_hash).unwrap();
+        }
+
+        {
+            let store = ClipboardStore::open(&path).unwrap();
+            assert_eq!(store.list().unwrap().len(), 1);
+            store.clear().unwrap();
+        }
+
+        let store = ClipboardStore::open(&path).unwrap();
+        assert!(store.list().unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(path);
     }
 }

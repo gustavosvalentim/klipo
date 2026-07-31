@@ -13,6 +13,7 @@ use commands::{
 };
 use shortcuts::{load_and_register_shortcuts, register_shortcuts_plugin};
 use state::AppState;
+use tauri::Manager;
 use window::{create_klipo_window, window_events_handler};
 
 const WINDOW_WIDTH: f64 = 250.0;
@@ -20,18 +21,7 @@ const WINDOW_HEIGHT: f64 = 350.0;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = AppState::new();
-
-    if app_state.input.enable().is_err() {
-        // TODO: display window asking for accessibility permissions
-        // TODO: try to identify if the user accepted the permissions
-        // because running `input_state.enable()` will open the permission
-        // window again
-        println!("Failed to enable input");
-    }
-
     tauri::Builder::default()
-        .manage(app_state)
         .on_window_event(window_events_handler)
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -48,6 +38,15 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            let data_directory = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_directory)?;
+            let app_state = AppState::new(data_directory.join("clipboard.sqlite3"))?;
+            if app_state.input.enable().is_err() {
+                // TODO: display window asking for accessibility permissions
+                println!("Failed to enable input");
+            }
+            app.manage(app_state);
 
             let app_handle = app.handle().clone();
 
