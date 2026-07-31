@@ -1,8 +1,9 @@
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
@@ -20,6 +21,7 @@ const MAX_ITEMS: usize = 120;
 #[derive(Debug)]
 pub enum ClipboardError {
     Database(rusqlite::Error),
+    Io(io::Error),
     PoisonError,
     ItemNotFound,
 }
@@ -28,6 +30,7 @@ impl std::fmt::Display for ClipboardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClipboardError::Database(error) => write!(f, "Clipboard database error: {error}"),
+            ClipboardError::Io(error) => write!(f, "Clipboard storage error: {error}"),
             ClipboardError::PoisonError => write!(f, "Clipboard database lock poisoned"),
             ClipboardError::ItemNotFound => write!(f, "Item not found"),
         }
@@ -42,28 +45,53 @@ impl From<rusqlite::Error> for ClipboardError {
     }
 }
 
+impl From<io::Error> for ClipboardError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 #[derive(Debug)]
 pub struct ClipboardStore {
     connection: Mutex<Connection>,
+    images_directory: PathBuf,
+    #[cfg(test)]
+    remove_images_on_drop: bool,
 }
 
 impl ClipboardStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClipboardError> {
-        Self::from_connection(Connection::open(path)?)
+        let path = path.as_ref();
+        let images_directory = path.with_file_name("clipboard-images");
+        Self::from_connection(Connection::open(path)?, images_directory)
     }
 
     #[cfg(test)]
     fn new() -> Self {
-        Self::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let images_directory =
+            std::env::temp_dir().join(format!("klipo-images-{}-{id}", std::process::id()));
+        let mut store =
+            Self::from_connection(Connection::open_in_memory().unwrap(), images_directory).unwrap();
+        store.remove_images_on_drop = true;
+        store
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, ClipboardError> {
+    fn from_connection(
+        connection: Connection,
+        images_directory: PathBuf,
+    ) -> Result<Self, ClipboardError> {
+        fs::create_dir_all(&images_directory)?;
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS clipboard_items (
+            "PRAGMA secure_delete = ON;
+             CREATE TABLE IF NOT EXISTS clipboard_items (
                 id INTEGER PRIMARY KEY,
                 hash TEXT NOT NULL UNIQUE,
                 text TEXT NOT NULL,
-                image_rgba BLOB,
+                image_file TEXT,
                 image_width INTEGER,
                 image_height INTEGER,
                 preview TEXT,
@@ -73,6 +101,9 @@ impl ClipboardStore {
 
         Ok(Self {
             connection: Mutex::new(connection),
+            images_directory,
+            #[cfg(test)]
+            remove_images_on_drop: false,
         })
     }
 
@@ -86,11 +117,13 @@ impl ClipboardStore {
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
         let mut statement = connection.prepare(
-            "SELECT text, hash, image_rgba, image_width, image_height, preview
+            "SELECT text, hash, image_file, image_width, image_height, preview
              FROM clipboard_items WHERE hash = ?1",
         )?;
 
-        Ok(statement.query_row([hash], row_to_item).optional()?)
+        Ok(statement
+            .query_row([hash], |row| self.row_to_item(row, true))
+            .optional()?)
     }
 
     #[allow(dead_code)]
@@ -104,14 +137,14 @@ impl ClipboardStore {
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
         let transaction = connection.transaction()?;
-        let sort_order: Option<i64> = transaction
+        let stored_item: Option<(i64, Option<String>)> = transaction
             .query_row(
-                "SELECT sort_order FROM clipboard_items WHERE hash = ?1",
+                "SELECT sort_order, image_file FROM clipboard_items WHERE hash = ?1",
                 [hash],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(sort_order) = sort_order else {
+        let Some((sort_order, image_file)) = stored_item else {
             return Err(ClipboardError::ItemNotFound);
         };
         let index = transaction.query_row(
@@ -121,6 +154,9 @@ impl ClipboardStore {
         )?;
         transaction.execute("DELETE FROM clipboard_items WHERE hash = ?1", [hash])?;
         transaction.commit()?;
+        if let Some(image_file) = image_file {
+            remove_file_if_exists(&self.images_directory.join(image_file))?;
+        }
 
         Ok(index)
     }
@@ -214,6 +250,10 @@ impl ClipboardStore {
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
+        let image_file = match image.as_ref() {
+            Some(image) => Some(self.write_image(&hash, image)?),
+            None => None,
+        };
         let transaction = connection.transaction()?;
         let exists = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM clipboard_items WHERE hash = ?1)",
@@ -227,12 +267,12 @@ impl ClipboardStore {
                 Some(image) => {
                     if let Some(text) = text.as_deref() {
                         transaction.execute(
-                            "UPDATE clipboard_items SET text = ?1, image_rgba = ?2,
+                            "UPDATE clipboard_items SET text = ?1, image_file = ?2,
                              image_width = ?3, image_height = ?4, preview = ?5, sort_order = ?6
                              WHERE hash = ?7",
                             params![
                                 text,
-                                &image.rgba,
+                                image_file,
                                 image.width,
                                 image.height,
                                 preview,
@@ -242,10 +282,10 @@ impl ClipboardStore {
                         )?;
                     } else {
                         transaction.execute(
-                            "UPDATE clipboard_items SET image_rgba = ?1, image_width = ?2,
+                            "UPDATE clipboard_items SET image_file = ?1, image_width = ?2,
                              image_height = ?3, preview = ?4, sort_order = ?5 WHERE hash = ?6",
                             params![
-                                &image.rgba,
+                                image_file,
                                 image.width,
                                 image.height,
                                 preview,
@@ -263,22 +303,18 @@ impl ClipboardStore {
                 }
             }
         } else {
-            let (rgba, width, height) = match image.as_ref() {
-                Some(image) => (
-                    Some(image.rgba.as_slice()),
-                    Some(image.width),
-                    Some(image.height),
-                ),
-                None => (None, None, None),
+            let (width, height) = match image.as_ref() {
+                Some(image) => (Some(image.width), Some(image.height)),
+                None => (None, None),
             };
             transaction.execute(
                 "INSERT INTO clipboard_items
-                 (hash, text, image_rgba, image_width, image_height, preview, sort_order)
+                 (hash, text, image_file, image_width, image_height, preview, sort_order)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     hash,
                     text.as_deref().unwrap_or_default(),
-                    rgba,
+                    image_file,
                     width,
                     height,
                     preview,
@@ -287,6 +323,17 @@ impl ClipboardStore {
             )?;
         }
 
+        let evicted_files = {
+            let mut statement = transaction.prepare(
+                "SELECT image_file FROM clipboard_items
+                 ORDER BY sort_order DESC LIMIT -1 OFFSET ?1",
+            )?;
+            let files = statement
+                .query_map([MAX_ITEMS], |row| row.get::<_, Option<String>>(0))?
+                .filter_map(Result::transpose)
+                .collect::<Result<Vec<_>, _>>()?;
+            files
+        };
         transaction.execute(
             "DELETE FROM clipboard_items WHERE id IN (
                 SELECT id FROM clipboard_items ORDER BY sort_order DESC LIMIT -1 OFFSET ?1
@@ -294,36 +341,121 @@ impl ClipboardStore {
             [MAX_ITEMS],
         )?;
         transaction.commit()?;
+        for image_file in evicted_files {
+            remove_file_if_exists(&self.images_directory.join(image_file))?;
+        }
 
         Ok(true)
     }
 
     pub fn clear(&self) -> Result<(), ClipboardError> {
-        self.connection
+        let connection = self
+            .connection
             .lock()
-            .map_err(|_| ClipboardError::PoisonError)?
-            .execute("DELETE FROM clipboard_items", [])?;
+            .map_err(|_| ClipboardError::PoisonError)?;
+        connection.execute("DELETE FROM clipboard_items", [])?;
+        match fs::remove_dir_all(&self.images_directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::create_dir_all(&self.images_directory)?;
         Ok(())
     }
 
     pub fn first(&self) -> Option<ClipboardItem> {
-        self.list().ok()?.into_iter().next()
+        let connection = self.connection.lock().ok()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT text, hash, image_file, image_width, image_height, preview
+                 FROM clipboard_items ORDER BY sort_order DESC LIMIT 1",
+            )
+            .ok()?;
+        statement
+            .query_row([], |row| self.row_to_item(row, true))
+            .optional()
+            .ok()
+            .flatten()
     }
 
+    #[cfg(test)]
     pub fn list(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
+        self.list_items(true)
+    }
+
+    pub fn list_for_display(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
+        self.list_items(false)
+    }
+
+    fn list_items(&self, load_images: bool) -> Result<Vec<ClipboardItem>, ClipboardError> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
         let mut statement = connection.prepare(
-            "SELECT text, hash, image_rgba, image_width, image_height, preview
+            "SELECT text, hash, image_file, image_width, image_height, preview
              FROM clipboard_items ORDER BY sort_order DESC",
         )?;
         let items = statement
-            .query_map([], row_to_item)?
+            .query_map([], |row| self.row_to_item(row, load_images))?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(items)
+    }
+
+    fn write_image(&self, hash: &str, image: &ClipboardImage) -> Result<String, ClipboardError> {
+        let filename = format!("{}.rgba", hash.trim_start_matches("image:"));
+        let path = self.images_directory.join(&filename);
+        let temporary = path.with_extension("rgba.tmp");
+        fs::write(&temporary, &image.rgba)?;
+        fs::rename(temporary, path)?;
+        Ok(filename)
+    }
+
+    fn row_to_item(
+        &self,
+        row: &rusqlite::Row<'_>,
+        load_image: bool,
+    ) -> rusqlite::Result<ClipboardItem> {
+        let image_file: Option<String> = row.get(2)?;
+        let width: Option<u32> = row.get(3)?;
+        let height: Option<u32> = row.get(4)?;
+        let image = if load_image {
+            match (image_file, width, height) {
+                (Some(image_file), Some(width), Some(height)) => {
+                    fs::read(self.images_directory.join(image_file))
+                        .ok()
+                        .and_then(|rgba| ClipboardImage::from_rgba(rgba, width, height))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(ClipboardItem {
+            text: row.get(0)?,
+            hash: row.get(1)?,
+            image,
+            preview: row.get(5)?,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClipboardStore {
+    fn drop(&mut self) {
+        if self.remove_images_on_drop {
+            let _ = fs::remove_dir_all(&self.images_directory);
+        }
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -333,23 +465,6 @@ fn next_sort_order(transaction: &Transaction<'_>) -> rusqlite::Result<i64> {
         [],
         |row| row.get(0),
     )
-}
-
-fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
-    let rgba: Option<Vec<u8>> = row.get(2)?;
-    let width: Option<u32> = row.get(3)?;
-    let height: Option<u32> = row.get(4)?;
-    let image = match (rgba, width, height) {
-        (Some(rgba), Some(width), Some(height)) => ClipboardImage::from_rgba(rgba, width, height),
-        _ => None,
-    };
-
-    Ok(ClipboardItem {
-        text: row.get(0)?,
-        hash: row.get(1)?,
-        image,
-        preview: row.get(5)?,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +620,8 @@ impl ClipboardEventsEmitter for tauri::AppHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{ClipboardImage, ClipboardStore, MAX_ITEMS};
 
     fn image(width: u32, height: u32, byte: u8) -> ClipboardImage {
@@ -598,6 +715,20 @@ mod tests {
     }
 
     #[test]
+    fn evicting_an_image_removes_its_file() {
+        let store = ClipboardStore::new();
+        assert!(store.add_image(image(1, 1, 1), None));
+        assert_eq!(fs::read_dir(&store.images_directory).unwrap().count(), 1);
+
+        for index in 0..MAX_ITEMS {
+            assert!(store.add_text(format!("item-{index}")));
+        }
+
+        assert_eq!(store.list().unwrap().len(), MAX_ITEMS);
+        assert_eq!(fs::read_dir(&store.images_directory).unwrap().count(), 0);
+    }
+
+    #[test]
     fn ignores_empty_or_invalid_content() {
         let store = ClipboardStore::new();
 
@@ -625,6 +756,17 @@ mod tests {
 
         let item = store.first().unwrap();
         assert!(item.preview.is_none());
+    }
+
+    #[test]
+    fn display_list_does_not_load_full_resolution_image_files() {
+        let store = ClipboardStore::new();
+        assert!(store.add_image(image(2, 2, 0x42), None));
+
+        let item = store.list_for_display().unwrap().remove(0);
+
+        assert!(item.image.is_none());
+        assert!(item.preview.is_some());
     }
 
     #[test]
@@ -764,10 +906,12 @@ mod tests {
         assert!(store.add_image(image(2, 2, 0x11), None));
         assert!(store.add_image(image(1, 1, 0x22), Some("mixed".into())));
         assert_eq!(store.list().unwrap().len(), 3);
+        assert_eq!(fs::read_dir(&store.images_directory).unwrap().count(), 2);
 
         assert!(store.clear().is_ok());
         assert!(store.list().unwrap().is_empty());
         assert!(store.first().is_none());
+        assert_eq!(fs::read_dir(&store.images_directory).unwrap().count(), 0);
     }
 
     #[test]
@@ -776,7 +920,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("klipo-clipboard-{unique}.sqlite3"));
+        let directory = std::env::temp_dir().join(format!("klipo-clipboard-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("clipboard.sqlite3");
+        let images_directory = directory.join("clipboard-images");
 
         let (image_hash, text_hash) = {
             let store = ClipboardStore::open(&path).unwrap();
@@ -791,6 +938,7 @@ mod tests {
             let items = store.list().unwrap();
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].image.as_ref().unwrap().rgba, vec![0x42; 8]);
+            assert_eq!(fs::read_dir(&images_directory).unwrap().count(), 1);
             store.move_to_top_by_hash(&text_hash).unwrap();
         }
 
@@ -798,6 +946,7 @@ mod tests {
             let store = ClipboardStore::open(&path).unwrap();
             assert_eq!(store.first().unwrap().hash, text_hash);
             store.delete_by_hash(&image_hash).unwrap();
+            assert_eq!(fs::read_dir(&images_directory).unwrap().count(), 0);
         }
 
         {
@@ -809,6 +958,6 @@ mod tests {
         let store = ClipboardStore::open(&path).unwrap();
         assert!(store.list().unwrap().is_empty());
         drop(store);
-        let _ = std::fs::remove_file(path);
+        let _ = fs::remove_dir_all(directory);
     }
 }

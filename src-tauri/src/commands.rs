@@ -14,7 +14,7 @@ use crate::{settings::ShortcutSettings, shortcuts};
 pub fn fetch_clipboard(state: State<'_, AppState>) -> Vec<ClipboardItem> {
     println!("Fetch clipboard");
 
-    state.clipboard.list().unwrap_or_default()
+    state.clipboard.list_for_display().unwrap_or_default()
 }
 
 #[tauri::command]
