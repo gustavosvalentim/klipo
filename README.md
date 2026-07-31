@@ -20,7 +20,7 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 - Configurable keyboard shortcuts, saved between app launches.
 - Floating, always-on-top clipboard menu.
 - Tray icon with Settings so the app can stay resident in the background.
-- In-memory history capped at 120 text and image items.
+- Persistent SQLite history capped at 120 text and image items.
 
 ## ⌨️ Usage
 
@@ -32,14 +32,14 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 Open **Settings…** from the tray menu to record and save replacement key combinations. Only the Open Klipo shortcut is global; navigation, paste, and delete shortcuts apply while the picker is focused. Escape is fixed and cannot be changed.
 
-Klipo captures text and images in the current session. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History is not persisted across app restarts, and full-resolution image data is kept in memory only — it is never written to disk, logs, or the network.
+Klipo captures text and images. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History metadata is stored in SQLite, while full-resolution image bytes are stored as files alongside it in the application data directory. History is restored across app restarts, and clipboard content is never written to logs or the network.
 
 ## 🗺️ Roadmap
 
 The following work is planned to evolve Klipo from a macOS text clipboard utility into a cross-platform clipboard manager.
 
 - [x] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
-- [ ] **Persistent history between sessions** — Save clipboard history to an application-data store, restore it at launch, and ensure clearing or deleting an item updates the stored history. This will include sensible limits for retained items and stored data size.
+- [x] **Persistent history between sessions** — Clipboard metadata is stored in SQLite and image bytes are stored as files in the application-data directory. Adding, reordering, deleting, and clearing items update persistent storage, with retention capped at 120 items.
 - [ ] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating log files so issues can be investigated after Klipo has been running.
 - [ ] **Linux support** — Replace macOS-specific window-focus and paste behavior with Linux-compatible implementations, verify clipboard monitoring and global shortcuts across the supported desktop environments, and provide Linux build/install artifacts.
 - [ ] **Windows support** — Implement Windows focus restoration and paste behavior, validate the picker, tray, global shortcut, and clipboard monitoring on Windows, and provide Windows release artifacts.
