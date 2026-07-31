@@ -257,58 +257,29 @@ impl ClipboardStore {
             None => None,
         };
         let transaction = connection.transaction()?;
-        let exists = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM clipboard_items WHERE hash = ?1)",
-            [&hash],
-            |row| row.get::<_, bool>(0),
-        )?;
         let updated_at = next_updated_at(&transaction)?;
+        let (width, height) = match image.as_ref() {
+            Some(image) => (Some(image.width), Some(image.height)),
+            None => (None, None),
+        };
 
-        if exists {
-            match image.as_ref() {
-                Some(image) => {
-                    if let Some(text) = text.as_deref() {
-                        transaction.execute(
-                            "UPDATE clipboard_items SET text = ?1, image_file = ?2,
-                             image_width = ?3, image_height = ?4, preview = ?5, updated_at = ?6
-                             WHERE hash = ?7",
-                            params![
-                                text,
-                                image_file,
-                                image.width,
-                                image.height,
-                                preview,
-                                updated_at,
-                                hash
-                            ],
-                        )?;
-                    } else {
-                        transaction.execute(
-                            "UPDATE clipboard_items SET image_file = ?1, image_width = ?2,
-                             image_height = ?3, preview = ?4, updated_at = ?5 WHERE hash = ?6",
-                            params![
-                                image_file,
-                                image.width,
-                                image.height,
-                                preview,
-                                updated_at,
-                                hash
-                            ],
-                        )?;
-                    }
-                }
-                None => {
-                    transaction.execute(
-                        "UPDATE clipboard_items SET text = ?1, updated_at = ?2 WHERE hash = ?3",
-                        params![text.as_deref().unwrap_or_default(), updated_at, hash],
-                    )?;
-                }
-            }
-        } else {
-            let (width, height) = match image.as_ref() {
-                Some(image) => (Some(image.width), Some(image.height)),
-                None => (None, None),
-            };
+        let updated = transaction.execute(
+            "UPDATE clipboard_items
+             SET text = COALESCE(?1, text), image_file = ?2, image_width = ?3,
+                 image_height = ?4, preview = ?5, updated_at = ?6
+             WHERE hash = ?7",
+            params![
+                text.as_deref(),
+                image_file,
+                width,
+                height,
+                preview,
+                updated_at,
+                hash
+            ],
+        )?;
+
+        if updated == 0 {
             transaction.execute(
                 "INSERT INTO clipboard_items
                  (hash, text, image_file, image_width, image_height, preview, created_at, updated_at)
