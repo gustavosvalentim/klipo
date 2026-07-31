@@ -1,10 +1,11 @@
 use md5::{Digest, Md5};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
@@ -81,7 +82,7 @@ impl ClipboardStore {
     }
 
     fn from_connection(
-        connection: Connection,
+        mut connection: Connection,
         images_directory: PathBuf,
     ) -> Result<Self, ClipboardError> {
         fs::create_dir_all(&images_directory)?;
@@ -95,9 +96,11 @@ impl ClipboardStore {
                 image_width INTEGER,
                 image_height INTEGER,
                 preview TEXT,
-                sort_order INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );",
         )?;
+        migrate_sort_order(&mut connection)?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -139,17 +142,17 @@ impl ClipboardStore {
         let transaction = connection.transaction()?;
         let stored_item: Option<(i64, Option<String>)> = transaction
             .query_row(
-                "SELECT sort_order, image_file FROM clipboard_items WHERE hash = ?1",
+                "SELECT updated_at, image_file FROM clipboard_items WHERE hash = ?1",
                 [hash],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some((sort_order, image_file)) = stored_item else {
+        let Some((updated_at, image_file)) = stored_item else {
             return Err(ClipboardError::ItemNotFound);
         };
         let index = transaction.query_row(
-            "SELECT COUNT(*) FROM clipboard_items WHERE sort_order > ?1",
-            [sort_order],
+            "SELECT COUNT(*) FROM clipboard_items WHERE updated_at > ?1",
+            [updated_at],
             |row| row.get::<_, usize>(0),
         )?;
         transaction.execute("DELETE FROM clipboard_items WHERE hash = ?1", [hash])?;
@@ -166,11 +169,10 @@ impl ClipboardStore {
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
+        let updated_at = next_updated_at(&connection)?;
         let changed = connection.execute(
-            "UPDATE clipboard_items
-             SET sort_order = (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM clipboard_items)
-             WHERE hash = ?1",
-            [hash],
+            "UPDATE clipboard_items SET updated_at = ?1 WHERE hash = ?2",
+            params![updated_at, hash],
         )?;
         if changed == 0 {
             return Err(ClipboardError::ItemNotFound);
@@ -260,7 +262,7 @@ impl ClipboardStore {
             [&hash],
             |row| row.get::<_, bool>(0),
         )?;
-        let next_order = next_sort_order(&transaction)?;
+        let updated_at = next_updated_at(&transaction)?;
 
         if exists {
             match image.as_ref() {
@@ -268,7 +270,7 @@ impl ClipboardStore {
                     if let Some(text) = text.as_deref() {
                         transaction.execute(
                             "UPDATE clipboard_items SET text = ?1, image_file = ?2,
-                             image_width = ?3, image_height = ?4, preview = ?5, sort_order = ?6
+                             image_width = ?3, image_height = ?4, preview = ?5, updated_at = ?6
                              WHERE hash = ?7",
                             params![
                                 text,
@@ -276,20 +278,20 @@ impl ClipboardStore {
                                 image.width,
                                 image.height,
                                 preview,
-                                next_order,
+                                updated_at,
                                 hash
                             ],
                         )?;
                     } else {
                         transaction.execute(
                             "UPDATE clipboard_items SET image_file = ?1, image_width = ?2,
-                             image_height = ?3, preview = ?4, sort_order = ?5 WHERE hash = ?6",
+                             image_height = ?3, preview = ?4, updated_at = ?5 WHERE hash = ?6",
                             params![
                                 image_file,
                                 image.width,
                                 image.height,
                                 preview,
-                                next_order,
+                                updated_at,
                                 hash
                             ],
                         )?;
@@ -297,8 +299,8 @@ impl ClipboardStore {
                 }
                 None => {
                     transaction.execute(
-                        "UPDATE clipboard_items SET text = ?1, sort_order = ?2 WHERE hash = ?3",
-                        params![text.as_deref().unwrap_or_default(), next_order, hash],
+                        "UPDATE clipboard_items SET text = ?1, updated_at = ?2 WHERE hash = ?3",
+                        params![text.as_deref().unwrap_or_default(), updated_at, hash],
                     )?;
                 }
             }
@@ -309,8 +311,8 @@ impl ClipboardStore {
             };
             transaction.execute(
                 "INSERT INTO clipboard_items
-                 (hash, text, image_file, image_width, image_height, preview, sort_order)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (hash, text, image_file, image_width, image_height, preview, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     hash,
                     text.as_deref().unwrap_or_default(),
@@ -318,7 +320,8 @@ impl ClipboardStore {
                     width,
                     height,
                     preview,
-                    next_order
+                    updated_at,
+                    updated_at
                 ],
             )?;
         }
@@ -326,7 +329,7 @@ impl ClipboardStore {
         let evicted_files = {
             let mut statement = transaction.prepare(
                 "SELECT image_file FROM clipboard_items
-                 ORDER BY sort_order DESC LIMIT -1 OFFSET ?1",
+                 ORDER BY updated_at DESC LIMIT -1 OFFSET ?1",
             )?;
             let files = statement
                 .query_map([MAX_ITEMS], |row| row.get::<_, Option<String>>(0))?
@@ -336,7 +339,7 @@ impl ClipboardStore {
         };
         transaction.execute(
             "DELETE FROM clipboard_items WHERE id IN (
-                SELECT id FROM clipboard_items ORDER BY sort_order DESC LIMIT -1 OFFSET ?1
+                SELECT id FROM clipboard_items ORDER BY updated_at DESC LIMIT -1 OFFSET ?1
             )",
             [MAX_ITEMS],
         )?;
@@ -368,7 +371,7 @@ impl ClipboardStore {
         let mut statement = connection
             .prepare(
                 "SELECT text, hash, image_file, image_width, image_height, preview
-                 FROM clipboard_items ORDER BY sort_order DESC LIMIT 1",
+                 FROM clipboard_items ORDER BY updated_at DESC LIMIT 1",
             )
             .ok()?;
         statement
@@ -394,7 +397,7 @@ impl ClipboardStore {
             .map_err(|_| ClipboardError::PoisonError)?;
         let mut statement = connection.prepare(
             "SELECT text, hash, image_file, image_width, image_height, preview
-             FROM clipboard_items ORDER BY sort_order DESC",
+             FROM clipboard_items ORDER BY updated_at DESC",
         )?;
         let items = statement
             .query_map([], |row| self.row_to_item(row, load_images))?
@@ -459,12 +462,65 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-fn next_sort_order(transaction: &Transaction<'_>) -> rusqlite::Result<i64> {
-    transaction.query_row(
-        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM clipboard_items",
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn next_updated_at(connection: &Connection) -> rusqlite::Result<i64> {
+    let now = now_ns();
+    let latest: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(updated_at), 0) FROM clipboard_items",
         [],
         |row| row.get(0),
-    )
+    )?;
+    Ok(now.max(latest.saturating_add(1)))
+}
+
+fn migrate_sort_order(connection: &mut Connection) -> rusqlite::Result<()> {
+    let has_sort_order = {
+        let mut statement = connection.prepare("PRAGMA table_info(clipboard_items)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.into_iter().any(|name| name == "sort_order")
+    };
+    if !has_sort_order {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "ALTER TABLE clipboard_items ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    transaction.execute(
+        "ALTER TABLE clipboard_items ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+
+    let ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM clipboard_items ORDER BY sort_order DESC, id DESC")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids
+    };
+    let now = now_ns();
+    for (offset, id) in ids.into_iter().enumerate() {
+        let timestamp = now.saturating_sub(offset as i64);
+        transaction.execute(
+            "UPDATE clipboard_items SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            params![timestamp, id],
+        )?;
+    }
+    transaction.execute("ALTER TABLE clipboard_items DROP COLUMN sort_order", [])?;
+    transaction.commit()
 }
 
 #[derive(Debug, Clone)]
@@ -622,7 +678,7 @@ impl ClipboardEventsEmitter for tauri::AppHandle {
 mod tests {
     use std::fs;
 
-    use super::{ClipboardImage, ClipboardStore, MAX_ITEMS};
+    use super::{ClipboardImage, ClipboardStore, Connection, MAX_ITEMS};
 
     fn image(width: u32, height: u32, byte: u8) -> ClipboardImage {
         ClipboardImage::from_rgba(vec![byte; (width * height * 4) as usize], width, height)
@@ -912,6 +968,96 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         assert!(store.first().is_none());
         assert_eq!(fs::read_dir(&store.images_directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stores_creation_and_update_timestamps() {
+        let store = ClipboardStore::new();
+        assert!(store.add_text("timestamped".into()));
+        let hash = store.first().unwrap().hash;
+
+        let (created_at, first_updated_at) = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at, updated_at FROM clipboard_items WHERE hash = ?1",
+                [&hash],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert!(created_at > 0);
+        assert_eq!(created_at, first_updated_at);
+
+        assert!(store.add_text("timestamped".into()));
+        let (created_at_after, updated_at_after) = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT created_at, updated_at FROM clipboard_items WHERE hash = ?1",
+                [&hash],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at_after, created_at);
+        assert!(updated_at_after > first_updated_at);
+    }
+
+    #[test]
+    fn migrates_legacy_sort_order_to_timestamps() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("klipo-legacy-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("clipboard.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE clipboard_items (
+                    id INTEGER PRIMARY KEY,
+                    hash TEXT NOT NULL UNIQUE,
+                    text TEXT NOT NULL,
+                    image_file TEXT,
+                    image_width INTEGER,
+                    image_height INTEGER,
+                    preview TEXT,
+                    sort_order INTEGER NOT NULL
+                );
+                INSERT INTO clipboard_items (hash, text, sort_order)
+                VALUES ('text:old', 'old', 1), ('text:new', 'new', 2);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = ClipboardStore::open(&path).unwrap();
+        let items = store.list().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
+
+        let columns = store
+            .connection
+            .lock()
+            .unwrap()
+            .prepare("PRAGMA table_info(clipboard_items)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "created_at"));
+        assert!(columns.iter().any(|column| column == "updated_at"));
+        assert!(!columns.iter().any(|column| column == "sort_order"));
+
+        drop(store);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
