@@ -263,39 +263,30 @@ impl ClipboardStore {
             None => (None, None),
         };
 
-        let updated = transaction.execute(
-            "UPDATE clipboard_items
-             SET text = COALESCE(?1, text), image_file = ?2, image_width = ?3,
-                 image_height = ?4, preview = ?5, updated_at = ?6
-             WHERE hash = ?7",
+        let _: i64 = transaction.query_row(
+            "INSERT INTO clipboard_items
+             (hash, text, image_file, image_width, image_height, preview, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(hash) DO UPDATE SET
+                 text = CASE WHEN excluded.text = '' THEN clipboard_items.text ELSE excluded.text END,
+                 image_file = excluded.image_file,
+                 image_width = excluded.image_width,
+                 image_height = excluded.image_height,
+                 preview = excluded.preview,
+                 updated_at = excluded.updated_at
+             RETURNING id",
             params![
-                text.as_deref(),
+                hash,
+                text.as_deref().unwrap_or_default(),
                 image_file,
                 width,
                 height,
                 preview,
                 updated_at,
-                hash
+                updated_at
             ],
+            |row| row.get(0),
         )?;
-
-        if updated == 0 {
-            transaction.execute(
-                "INSERT INTO clipboard_items
-                 (hash, text, image_file, image_width, image_height, preview, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    hash,
-                    text.as_deref().unwrap_or_default(),
-                    image_file,
-                    width,
-                    height,
-                    preview,
-                    updated_at,
-                    updated_at
-                ],
-            )?;
-        }
 
         let evicted_files = {
             let mut statement = transaction.prepare(
