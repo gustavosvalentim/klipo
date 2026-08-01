@@ -78,11 +78,7 @@ pub fn run() {
 
             // TODO: implement shutdown
             let listener = ClipboardEventsListener::new(app_handle)?;
-            std::thread::spawn(move || {
-                if let Err(error) = listener.start() {
-                    error!(error:debug = error; "Clipboard listener stopped");
-                }
-            });
+            std::thread::spawn(move || listener.start());
 
             info!("Application started");
             Ok(())
