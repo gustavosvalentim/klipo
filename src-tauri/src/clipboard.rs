@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
+use log::{debug, error};
 use tauri::{Emitter, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -70,7 +71,7 @@ impl ClipboardEventsHandler {
 
 impl ClipboardHandler for ClipboardEventsHandler {
     fn on_clipboard_change(&mut self) -> CallbackResult {
-        println!("Clipboard changed");
+        debug!("Clipboard changed");
 
         let klipo_pid = std::process::id();
         let focused_window_pid = get_focused_window();
@@ -99,17 +100,19 @@ impl ClipboardHandler for ClipboardEventsHandler {
 
         match accepted {
             Ok(true) => {
-                let _ = self.app.emit_clipboard_changed();
+                if let Err(error) = self.app.emit_clipboard_changed() {
+                    error!(error:debug = error; "Failed to emit clipboard changed event");
+                }
             }
             Ok(false) => {}
-            Err(error) => println!("Failed to store clipboard item: {error}"),
+            Err(error) => error!(error:debug = error; "Failed to store clipboard item"),
         }
 
         CallbackResult::Next
     }
 
     fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
-        println!("Clipboard error: {error}");
+        error!(error:debug = error; "Clipboard error");
         CallbackResult::Next
     }
 }

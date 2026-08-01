@@ -39,6 +39,7 @@ pub struct InputState {
     pub enigo: Mutex<Option<Enigo>>,
 }
 
+#[derive(Debug)]
 pub enum InputStateError {
     PoisonError,
     EnigoError,

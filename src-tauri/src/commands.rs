@@ -1,5 +1,6 @@
 use std::vec::Vec;
 
+use log::{debug, error, warn};
 use tauri::image::Image;
 use tauri::{AppHandle, State};
 use tauri_plugin_clipboard_manager::{
@@ -14,9 +15,20 @@ use crate::{settings::ShortcutSettings, shortcuts};
 
 #[tauri::command]
 pub fn fetch_clipboard(state: State<'_, AppState>) -> Vec<ClipboardItem> {
-    println!("Fetch clipboard");
+    let items = state
+        .clipboard
+        .list_for_display()
+        .unwrap_or_else(|error_value| {
+            error!(error:debug = error_value; "Failed to fetch clipboard history");
+            Vec::new()
+        });
+    debug!(item_count = items.len(); "Fetched clipboard history");
+    items
+}
 
-    state.clipboard.list_for_display().unwrap_or_default()
+#[tauri::command]
+pub fn log_frontend_error(context: String, error: String) {
+    error!(context:% = context, error:% = error; "Frontend error");
 }
 
 #[tauri::command]
@@ -58,12 +70,12 @@ pub fn save_shortcuts(
 
 #[tauri::command]
 pub fn clear(app: AppHandle, state: State<'_, AppState>) {
-    if let Err(e) = state.clipboard.clear() {
-        println!("Failed to clear clipboard history: {e}");
+    if let Err(error_value) = state.clipboard.clear() {
+        error!(error:debug = error_value; "Failed to clear clipboard history");
     }
 
-    if let Err(e) = app.emit_clipboard_changed() {
-        println!("Failed to emit clipboard changed event: {e}");
+    if let Err(error_value) = app.emit_clipboard_changed() {
+        error!(error:debug = error_value; "Failed to emit clipboard changed event");
     }
 }
 
@@ -91,8 +103,8 @@ fn write_image_to_clipboard(
 ) -> ClipboardResult<()> {
     let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
 
-    app.clipboard().write_image(&img).or_else(|e| {
-        println!("Failed to write image to clipboard: {e}");
+    app.clipboard().write_image(&img).or_else(|error_value| {
+        warn!(error:debug = error_value; "Failed to write image to clipboard; trying text fallback");
         write_text_to_clipboard(app, fallback)
     })
 }
@@ -115,62 +127,66 @@ pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
         return;
     };
 
-    if let Err(e) = write_to_clipboard(&app, &item) {
-        println!("Failed to write item to clipboard: {e}");
+    if let Err(error_value) = write_to_clipboard(&app, &item) {
+        error!(error:debug = error_value; "Failed to write item to clipboard");
         return;
     }
 
-    let _ = state.clipboard.move_to_top_by_hash(hash);
+    if let Err(error_value) = state.clipboard.move_to_top_by_hash(hash) {
+        error!(error:debug = error_value; "Failed to move pasted item to the top");
+    }
 
     if let Some(window) = get_main_window(&app) {
-        if window.hide().is_err() {
-            println!("Failed to hide window");
+        if let Err(error_value) = window.hide() {
+            error!(error:debug = error_value; "Failed to hide window");
         }
     }
 
-    if restore_focused_window(&state).is_err() {
-        println!("Failed to restore focus");
+    if let Err(error_value) = restore_focused_window(&state) {
+        error!(error:debug = error_value; "Failed to restore focus");
         return;
     }
 
     let Ok(mut guard) = state.input.enigo.lock() else {
-        println!("Failed to lock input state");
+        error!("Failed to lock input state");
         return;
     };
 
     let Some(enigo) = guard.as_mut() else {
-        println!("Failed to get enigo");
+        error!("Failed to get enigo");
         return;
     };
 
-    let _ = simulate_paste_input(enigo);
+    if let Err(error_value) = simulate_paste_input(enigo) {
+        error!(error:debug = error_value; "Failed to simulate paste input");
+    }
 }
 
 #[tauri::command]
 pub fn quit(app: AppHandle) {
     let Some(window) = get_main_window(&app) else {
-        println!("Failed to get main window");
+        error!("Failed to get main window");
         return;
     };
 
-    if let Err(e) = window.close() {
-        println!("Failed to close window: {e}");
+    if let Err(error_value) = window.close() {
+        error!(error:debug = error_value; "Failed to close window");
     }
 }
 
 #[tauri::command]
 pub fn close(app: AppHandle, state: State<'_, AppState>) {
     let Some(window) = get_main_window(&app) else {
-        println!("Failed to get main window");
+        error!("Failed to get main window");
         return;
     };
 
-    if let Err(e) = window.hide() {
-        println!("Failed to hide window: {e}");
+    if let Err(error_value) = window.hide() {
+        error!(error:debug = error_value; "Failed to hide window");
     }
 
-    if let Err(e) = restore_focused_window(&state) {
-        println!("Failed to restore focus: {e}");
+    if let Err(error_value) = restore_focused_window(&state) {
+        error!(error:debug = error_value; "Failed to restore focus");
     }
 }
 
@@ -181,18 +197,18 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
     }
 
     let Ok(item_idx) = state.clipboard.delete_by_hash(hash) else {
-        println!("Failed to delete item from clipboard history");
+        error!("Failed to delete item from clipboard history");
         return;
     };
 
-    if let Err(e) = app.emit_clipboard_changed() {
-        println!("Failed to emit clipboard changed event: {e}");
+    if let Err(error_value) = app.emit_clipboard_changed() {
+        error!(error:debug = error_value; "Failed to emit clipboard changed event");
     }
 
     if item_idx == 0 {
         if let Some(item) = state.clipboard.first() {
-            if let Err(e) = write_to_clipboard(&app, &item) {
-                println!("Failed to write first item to clipboard: {e}");
+            if let Err(error_value) = write_to_clipboard(&app, &item) {
+                error!(error:debug = error_value; "Failed to write first item to clipboard");
             }
         }
     }

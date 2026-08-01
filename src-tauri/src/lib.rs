@@ -1,6 +1,7 @@
 mod clipboard;
 mod commands;
 mod input;
+mod logging;
 mod settings;
 mod shortcuts;
 mod state;
@@ -10,8 +11,10 @@ mod window;
 
 use clipboard::ClipboardEventsListener;
 use commands::{
-    clear, close, delete_item, fetch_clipboard, get_shortcuts, paste, quit, save_shortcuts,
+    clear, close, delete_item, fetch_clipboard, get_shortcuts, log_frontend_error, paste, quit,
+    save_shortcuts,
 };
+use log::{error, info};
 use shortcuts::{load_and_register_shortcuts, register_shortcuts_plugin};
 use state::AppState;
 use tauri::Manager;
@@ -28,6 +31,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             fetch_clipboard,
+            log_frontend_error,
             paste,
             clear,
             quit,
@@ -37,15 +41,20 @@ pub fn run() {
             save_shortcuts,
         ])
         .setup(|app| {
+            let log_directory = app.path().app_log_dir()?;
+            logging::init(&log_directory)?;
+            info!(log_directory:debug = log_directory; "Application logging initialized");
+            info!("Application starting");
+
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let data_directory = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_directory)?;
             let app_state = AppState::new(data_directory.join("clipboard.sqlite3"))?;
-            if app_state.input.enable().is_err() {
+            if let Err(error) = app_state.input.enable() {
                 // TODO: display window asking for accessibility permissions
-                println!("Failed to enable input");
+                error!(error:debug = error; "Failed to enable input");
             }
             app.manage(app_state);
 
@@ -67,11 +76,16 @@ pub fn run() {
             // TODO: implement shutdown
             let listener = ClipboardEventsListener::new(app_handle)?;
             std::thread::spawn(move || {
-                listener.start().expect("Clipboard master shutdown");
+                if let Err(error) = listener.start() {
+                    error!(error:debug = error; "Clipboard listener stopped");
+                }
             });
 
+            info!("Application started");
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .unwrap_or_else(|error_value| {
+            error!(error:debug = error_value; "Tauri application stopped with an error");
+        });
 }
