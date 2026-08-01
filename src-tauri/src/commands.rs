@@ -1,13 +1,9 @@
 use std::vec::Vec;
 
-use log::{debug, error, warn};
-use tauri::image::Image;
+use log::{debug, error};
 use tauri::{AppHandle, State};
-use tauri_plugin_clipboard_manager::{
-    ClipboardExt, Error as ClipboardError, Result as ClipboardResult,
-};
 
-use crate::clipboard::{ClipboardEventsEmitter, ClipboardImage, ClipboardItem};
+use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem, SystemClipboard};
 use crate::input::simulate_paste_input;
 use crate::state::AppState;
 use crate::window::{get_main_window, restore_focused_window};
@@ -79,46 +75,12 @@ pub fn clear(app: AppHandle, state: State<'_, AppState>) {
     }
 }
 
-const EMPTY_TEXT_ERROR: &str = "No text to write to clipboard";
-
-fn validate_text_to_clipboard(text: &str) -> ClipboardResult<()> {
-    if text.is_empty() {
-        return Err(ClipboardError::Clipboard(EMPTY_TEXT_ERROR.into()));
-    }
-
-    Ok(())
-}
-
-/// Write text to the system clipboard. Empty text is treated as a failed write.
-fn write_text_to_clipboard(app: &AppHandle, text: &str) -> ClipboardResult<()> {
-    validate_text_to_clipboard(text)?;
-    app.clipboard().write_text(text)
-}
-
-/// Write an image to the system clipboard.
-fn write_image_to_clipboard(
-    app: &AppHandle,
-    image: &ClipboardImage,
-    fallback: &str,
-) -> ClipboardResult<()> {
-    let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
-
-    app.clipboard().write_image(&img).or_else(|error_value| {
-        warn!(error:debug = error_value; "Failed to write image to clipboard; trying text fallback");
-        write_text_to_clipboard(app, fallback)
-    })
-}
-
-/// Write a clipboard item's content to the system clipboard.
-///
-/// Writes the item's image if present, falling back to the item's text if
-/// there is no image or image writing fails. Clipboard writes replace the
-/// whole contents, so only one of the two ends up written.
-pub(crate) fn write_to_clipboard(app: &AppHandle, item: &ClipboardItem) -> ClipboardResult<()> {
-    match item.image.as_ref() {
-        Some(image) => write_image_to_clipboard(app, image, &item.text),
-        None => write_text_to_clipboard(app, &item.text),
-    }
+/// Write and verify a clipboard item's content before any paste side effects.
+pub(crate) fn write_to_clipboard(
+    system_clipboard: &SystemClipboard,
+    item: &ClipboardItem,
+) -> Result<(), crate::clipboard::SystemClipboardError> {
+    system_clipboard.write_item(item)
 }
 
 #[tauri::command]
@@ -127,7 +89,7 @@ pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
         return;
     };
 
-    if let Err(error_value) = write_to_clipboard(&app, &item) {
+    if let Err(error_value) = write_to_clipboard(&state.system_clipboard, &item) {
         error!(error:debug = error_value; "Failed to write item to clipboard");
         return;
     }
@@ -207,22 +169,9 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
 
     if item_idx == 0 {
         if let Some(item) = state.clipboard.first() {
-            if let Err(error_value) = write_to_clipboard(&app, &item) {
+            if let Err(error_value) = write_to_clipboard(&state.system_clipboard, &item) {
                 error!(error:debug = error_value; "Failed to write first item to clipboard");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{validate_text_to_clipboard, ClipboardError, EMPTY_TEXT_ERROR};
-
-    #[test]
-    fn empty_text_is_rejected_as_a_clipboard_write() {
-        assert!(matches!(
-            validate_text_to_clipboard(""),
-            Err(ClipboardError::Clipboard(message)) if message == EMPTY_TEXT_ERROR
-        ));
     }
 }

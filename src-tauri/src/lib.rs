@@ -28,7 +28,6 @@ pub fn run() {
     tauri::Builder::default()
         .on_window_event(window_events_handler)
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             fetch_clipboard,
             log_frontend_error,
