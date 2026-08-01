@@ -11,10 +11,6 @@
     "opener:default",
     "core:window:allow-hide",
     "core:app:allow-default-window-icon",
-    "clipboard-manager:default",
-    "clipboard-manager:allow-clear",
-    "clipboard-manager:allow-read-image",
-    "clipboard-manager:allow-read-text",
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister"

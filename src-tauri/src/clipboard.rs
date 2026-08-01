@@ -40,6 +40,10 @@ impl ClipboardImage {
 pub enum SystemClipboardError {
     Initialization,
     Read,
+    Write,
+    Verification,
+    InvalidImage,
+    EmptyContent,
     LockPoisoned,
 }
 
@@ -48,6 +52,10 @@ impl std::fmt::Display for SystemClipboardError {
         let message = match self {
             Self::Initialization => "Failed to initialize system clipboard",
             Self::Read => "Failed to read system clipboard",
+            Self::Write => "Failed to write system clipboard",
+            Self::Verification => "System clipboard write verification failed",
+            Self::InvalidImage => "Invalid clipboard image",
+            Self::EmptyContent => "No clipboard content to write",
             Self::LockPoisoned => "System clipboard lock is poisoned",
         };
         f.write_str(message)
@@ -65,6 +73,8 @@ pub struct ClipboardSnapshot {
 trait ClipboardBackend: Send {
     fn get(&self, formats: &[ContentFormat])
         -> Result<Vec<ClipboardContent>, SystemClipboardError>;
+    fn has(&self, format: ContentFormat) -> bool;
+    fn set(&self, contents: Vec<ClipboardContent>) -> Result<(), SystemClipboardError>;
 }
 
 struct NativeClipboardBackend {
@@ -79,6 +89,16 @@ impl ClipboardBackend for NativeClipboardBackend {
         self.context
             .get(formats)
             .map_err(|_| SystemClipboardError::Read)
+    }
+
+    fn has(&self, format: ContentFormat) -> bool {
+        self.context.has(format)
+    }
+
+    fn set(&self, contents: Vec<ClipboardContent>) -> Result<(), SystemClipboardError> {
+        self.context
+            .set(contents)
+            .map_err(|_| SystemClipboardError::Write)
     }
 }
 
@@ -104,6 +124,70 @@ impl SystemClipboard {
         };
 
         Ok(snapshot_from_contents(contents))
+    }
+
+    pub fn write_item(&self, item: &ClipboardItem) -> Result<(), SystemClipboardError> {
+        let text = (!item.text.is_empty()).then_some(item.text.as_str());
+
+        match (item.image.as_ref(), text) {
+            (Some(image), Some(text)) => self.write_mixed(rust_image_from_clipboard(image), text),
+            (Some(image), None) => {
+                let image = rust_image_from_clipboard(image)?;
+                self.write_and_verify(vec![ClipboardContent::Image(image)], true, false)
+            }
+            (None, Some(text)) => {
+                self.write_and_verify(vec![ClipboardContent::Text(text.to_owned())], false, true)
+            }
+            (None, None) => Err(SystemClipboardError::EmptyContent),
+        }
+    }
+
+    fn write_mixed(
+        &self,
+        image: Result<RustImageData, SystemClipboardError>,
+        text: &str,
+    ) -> Result<(), SystemClipboardError> {
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+
+        let mixed_result = match image {
+            Ok(image) => write_and_verify(
+                context.as_ref(),
+                vec![
+                    ClipboardContent::Image(image),
+                    ClipboardContent::Text(text.to_owned()),
+                ],
+                true,
+                true,
+            ),
+            Err(error) => Err(error),
+        };
+
+        if mixed_result.is_ok() {
+            return Ok(());
+        }
+
+        write_and_verify(
+            context.as_ref(),
+            vec![ClipboardContent::Text(text.to_owned())],
+            false,
+            true,
+        )
+    }
+
+    fn write_and_verify(
+        &self,
+        contents: Vec<ClipboardContent>,
+        requires_image: bool,
+        requires_text: bool,
+    ) -> Result<(), SystemClipboardError> {
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        write_and_verify(context.as_ref(), contents, requires_image, requires_text)
     }
 
     #[cfg(test)]
@@ -136,6 +220,33 @@ fn clipboard_image_from_rust(image: RustImageData) -> Option<ClipboardImage> {
     let (width, height) = image.get_size();
     let rgba = image.to_rgba8().ok()?.into_raw();
     ClipboardImage::from_rgba(rgba, width, height)
+}
+
+fn rust_image_from_clipboard(
+    image: &ClipboardImage,
+) -> Result<RustImageData, SystemClipboardError> {
+    let rgba = ::image::RgbaImage::from_raw(image.width, image.height, image.rgba.clone())
+        .ok_or(SystemClipboardError::InvalidImage)?;
+    Ok(RustImageData::from_dynamic_image(
+        ::image::DynamicImage::ImageRgba8(rgba),
+    ))
+}
+
+fn write_and_verify(
+    context: &dyn ClipboardBackend,
+    contents: Vec<ClipboardContent>,
+    requires_image: bool,
+    requires_text: bool,
+) -> Result<(), SystemClipboardError> {
+    context.set(contents)?;
+
+    let image_available = !requires_image || context.has(ContentFormat::Image);
+    let text_available = !requires_text || context.has(ContentFormat::Text);
+    if image_available && text_available {
+        Ok(())
+    } else {
+        Err(SystemClipboardError::Verification)
+    }
 }
 
 fn store_snapshot(
@@ -303,30 +414,65 @@ impl ClipboardEventsEmitter for tauri::AppHandle {
 mod tests {
     use super::{
         capture_clipboard_change, store_snapshot, ClipboardBackend, ClipboardCaptureError,
-        ClipboardContent, ClipboardSnapshot, ContentFormat, RustImage, RustImageData,
-        SystemClipboard, SystemClipboardError,
+        ClipboardContent, ClipboardImage, ClipboardItem, ClipboardSnapshot, ContentFormat,
+        RustImage, RustImageData, SystemClipboard, SystemClipboardError,
     };
     use crate::storage::ClipboardStore;
     use image::{DynamicImage, RgbaImage};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    #[derive(Debug, PartialEq)]
+    enum FakeWriteContent {
+        Image {
+            rgba: Vec<u8>,
+            width: u32,
+            height: u32,
+        },
+        Text(String),
+    }
+
+    #[derive(Default)]
+    struct FakeClipboardObservations {
+        requested_formats: Vec<(bool, bool)>,
+        writes: Vec<Vec<FakeWriteContent>>,
+        verified_formats: Vec<ContentFormatKind>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ContentFormatKind {
+        Image,
+        Text,
+    }
+
     struct FakeClipboard {
         responses: Mutex<VecDeque<Result<Vec<ClipboardContent>, SystemClipboardError>>>,
-        requested_formats: Arc<Mutex<Vec<(bool, bool)>>>,
+        observations: Arc<Mutex<FakeClipboardObservations>>,
+        set_results: Mutex<VecDeque<Result<(), SystemClipboardError>>>,
+        has_results: Mutex<VecDeque<bool>>,
     }
 
     impl FakeClipboard {
         fn new(
             responses: Vec<Result<Vec<ClipboardContent>, SystemClipboardError>>,
-        ) -> (Self, Arc<Mutex<Vec<(bool, bool)>>>) {
-            let requested_formats = Arc::new(Mutex::new(Vec::new()));
+        ) -> (Self, Arc<Mutex<FakeClipboardObservations>>) {
+            Self::with_write_behavior(responses, Vec::new(), Vec::new())
+        }
+
+        fn with_write_behavior(
+            responses: Vec<Result<Vec<ClipboardContent>, SystemClipboardError>>,
+            set_results: Vec<Result<(), SystemClipboardError>>,
+            has_results: Vec<bool>,
+        ) -> (Self, Arc<Mutex<FakeClipboardObservations>>) {
+            let observations = Arc::new(Mutex::new(FakeClipboardObservations::default()));
             (
                 Self {
                     responses: Mutex::new(responses.into()),
-                    requested_formats: Arc::clone(&requested_formats),
+                    observations: Arc::clone(&observations),
+                    set_results: Mutex::new(set_results.into()),
+                    has_results: Mutex::new(has_results.into()),
                 },
-                requested_formats,
+                observations,
             )
         }
     }
@@ -342,15 +488,54 @@ mod tests {
             let has_text = formats
                 .iter()
                 .any(|format| matches!(format, ContentFormat::Text));
-            self.requested_formats
+            self.observations
                 .lock()
                 .unwrap()
+                .requested_formats
                 .push((has_image, has_text));
             self.responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn has(&self, format: ContentFormat) -> bool {
+            let format_kind = match format {
+                ContentFormat::Image => ContentFormatKind::Image,
+                ContentFormat::Text => ContentFormatKind::Text,
+                _ => unreachable!("write verification only asks for image and text"),
+            };
+            self.observations
+                .lock()
+                .unwrap()
+                .verified_formats
+                .push(format_kind);
+            self.has_results.lock().unwrap().pop_front().unwrap_or(true)
+        }
+
+        fn set(&self, contents: Vec<ClipboardContent>) -> Result<(), SystemClipboardError> {
+            let write = contents
+                .into_iter()
+                .map(|content| match content {
+                    ClipboardContent::Image(image) => {
+                        let (width, height) = image.get_size();
+                        FakeWriteContent::Image {
+                            rgba: image.to_rgba8().unwrap().into_raw(),
+                            width,
+                            height,
+                        }
+                    }
+                    ClipboardContent::Text(text) => FakeWriteContent::Text(text),
+                    _ => unreachable!("write tests only use image and text"),
+                })
+                .collect();
+            self.observations.lock().unwrap().writes.push(write);
+            self.set_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()))
         }
     }
 
@@ -369,7 +554,10 @@ mod tests {
 
         assert_eq!(snapshot.text.as_deref(), Some("hello"));
         assert!(snapshot.image.is_none());
-        assert_eq!(*requested_formats.lock().unwrap(), vec![(true, true)]);
+        assert_eq!(
+            requested_formats.lock().unwrap().requested_formats,
+            vec![(true, true)]
+        );
     }
 
     #[test]
@@ -481,5 +669,218 @@ mod tests {
         ));
         assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
         assert_eq!(store.first().unwrap().text, "recovered");
+    }
+
+    fn item(text: &str, image: Option<ClipboardImage>) -> ClipboardItem {
+        ClipboardItem {
+            text: text.into(),
+            hash: "test-hash".into(),
+            image,
+            preview: None,
+        }
+    }
+
+    fn clipboard_image(rgba: Vec<u8>, width: u32, height: u32) -> ClipboardImage {
+        ClipboardImage::from_rgba(rgba, width, height).unwrap()
+    }
+
+    #[test]
+    fn writes_text_once_and_verifies_text() {
+        let (backend, observations) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), vec![true]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        clipboard.write_item(&item("hello", None)).unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.writes,
+            vec![vec![FakeWriteContent::Text("hello".into())]]
+        );
+        assert_eq!(observations.verified_formats, vec![ContentFormatKind::Text]);
+    }
+
+    #[test]
+    fn writes_image_once_with_original_pixels_dimensions_and_alpha() {
+        let rgba = vec![1, 2, 3, 4, 5, 6, 7, 128];
+        let (backend, observations) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), vec![true]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        clipboard
+            .write_item(&item("", Some(clipboard_image(rgba.clone(), 2, 1))))
+            .unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.writes,
+            vec![vec![FakeWriteContent::Image {
+                rgba,
+                width: 2,
+                height: 1,
+            }]]
+        );
+        assert_eq!(
+            observations.verified_formats,
+            vec![ContentFormatKind::Image]
+        );
+    }
+
+    #[test]
+    fn writes_mixed_content_in_one_image_first_operation() {
+        let (backend, observations) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), vec![true, true]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        clipboard
+            .write_item(&item(
+                "fallback",
+                Some(clipboard_image(vec![10, 20, 30, 40], 1, 1)),
+            ))
+            .unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations.writes,
+            vec![vec![
+                FakeWriteContent::Image {
+                    rgba: vec![10, 20, 30, 40],
+                    width: 1,
+                    height: 1,
+                },
+                FakeWriteContent::Text("fallback".into()),
+            ]]
+        );
+        assert_eq!(
+            observations.verified_formats,
+            vec![ContentFormatKind::Image, ContentFormatKind::Text]
+        );
+    }
+
+    #[test]
+    fn incomplete_mixed_write_uses_one_verified_text_fallback() {
+        let (backend, observations) = FakeClipboard::with_write_behavior(
+            Vec::new(),
+            vec![Ok(()), Ok(())],
+            vec![true, false, true],
+        );
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        clipboard
+            .write_item(&item(
+                "fallback",
+                Some(clipboard_image(vec![10, 20, 30, 40], 1, 1)),
+            ))
+            .unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.writes.len(), 2);
+        assert_eq!(
+            observations.writes[1],
+            vec![FakeWriteContent::Text("fallback".into())]
+        );
+        assert_eq!(
+            observations.verified_formats,
+            vec![
+                ContentFormatKind::Image,
+                ContentFormatKind::Text,
+                ContentFormatKind::Text,
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_mixed_write_uses_fallback_once() {
+        let (backend, observations) = FakeClipboard::with_write_behavior(
+            Vec::new(),
+            vec![Err(SystemClipboardError::Write), Ok(())],
+            vec![true],
+        );
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        clipboard
+            .write_item(&item(
+                "fallback",
+                Some(clipboard_image(vec![10, 20, 30, 40], 1, 1)),
+            ))
+            .unwrap();
+
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.writes.len(), 2);
+        assert_eq!(
+            observations.writes[1],
+            vec![FakeWriteContent::Text("fallback".into())]
+        );
+        assert_eq!(observations.verified_formats, vec![ContentFormatKind::Text]);
+    }
+
+    #[test]
+    fn unverified_mixed_fallback_fails_without_a_third_write() {
+        let (backend, observations) = FakeClipboard::with_write_behavior(
+            Vec::new(),
+            vec![Ok(()), Ok(())],
+            vec![true, false, false],
+        );
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        assert!(matches!(
+            clipboard.write_item(&item(
+                "fallback",
+                Some(clipboard_image(vec![10, 20, 30, 40], 1, 1)),
+            )),
+            Err(SystemClipboardError::Verification)
+        ));
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.writes.len(), 2);
+        assert_eq!(
+            observations.verified_formats,
+            vec![
+                ContentFormatKind::Image,
+                ContentFormatKind::Text,
+                ContentFormatKind::Text,
+            ]
+        );
+    }
+
+    #[test]
+    fn unverified_text_write_fails_without_a_second_write() {
+        let (backend, observations) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), vec![false]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        assert!(matches!(
+            clipboard.write_item(&item("hello", None)),
+            Err(SystemClipboardError::Verification)
+        ));
+        assert_eq!(observations.lock().unwrap().writes.len(), 1);
+    }
+
+    #[test]
+    fn failed_image_write_does_not_use_empty_text_as_fallback() {
+        let (backend, observations) = FakeClipboard::with_write_behavior(
+            Vec::new(),
+            vec![Err(SystemClipboardError::Write)],
+            Vec::new(),
+        );
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        assert!(matches!(
+            clipboard.write_item(&item("", Some(clipboard_image(vec![1, 2, 3, 4], 1, 1)),)),
+            Err(SystemClipboardError::Write)
+        ));
+        assert_eq!(observations.lock().unwrap().writes.len(), 1);
+    }
+
+    #[test]
+    fn empty_item_is_rejected_without_a_write() {
+        let (backend, observations) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), Vec::new());
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        assert!(matches!(
+            clipboard.write_item(&item("", None)),
+            Err(SystemClipboardError::EmptyContent)
+        ));
+        assert!(observations.lock().unwrap().writes.is_empty());
     }
 }
