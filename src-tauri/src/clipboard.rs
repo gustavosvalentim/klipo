@@ -166,15 +166,15 @@ impl SystemClipboard {
         };
 
         if mixed_result.is_ok() {
-            return Ok(());
+            Ok(())
+        } else {
+            write_and_verify(
+                context.as_ref(),
+                vec![ClipboardContent::Text(text.to_owned())],
+                false,
+                true,
+            )
         }
-
-        write_and_verify(
-            context.as_ref(),
-            vec![ClipboardContent::Text(text.to_owned())],
-            false,
-            true,
-        )
     }
 
     fn write_and_verify(
