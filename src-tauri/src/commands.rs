@@ -2,7 +2,9 @@ use std::vec::Vec;
 
 use tauri::image::Image;
 use tauri::{AppHandle, State};
-use tauri_plugin_clipboard_manager::{ClipboardExt, Result as ClipboardResult};
+use tauri_plugin_clipboard_manager::{
+    ClipboardExt, Error as ClipboardError, Result as ClipboardResult,
+};
 
 use crate::clipboard::{ClipboardEventsEmitter, ClipboardImage, ClipboardItem};
 use crate::input::simulate_paste_input;
@@ -65,12 +67,19 @@ pub fn clear(app: AppHandle, state: State<'_, AppState>) {
     }
 }
 
-/// Write text to the system clipboard. Empty text is skipped.
-fn write_text_to_clipboard(app: &AppHandle, text: &str) -> ClipboardResult<()> {
+const EMPTY_TEXT_ERROR: &str = "No text to write to clipboard";
+
+fn validate_text_to_clipboard(text: &str) -> ClipboardResult<()> {
     if text.is_empty() {
-        return Ok(());
+        return Err(ClipboardError::Clipboard(EMPTY_TEXT_ERROR.into()));
     }
 
+    Ok(())
+}
+
+/// Write text to the system clipboard. Empty text is treated as a failed write.
+fn write_text_to_clipboard(app: &AppHandle, text: &str) -> ClipboardResult<()> {
+    validate_text_to_clipboard(text)?;
     app.clipboard().write_text(text)
 }
 
@@ -186,5 +195,18 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
                 println!("Failed to write first item to clipboard: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_text_to_clipboard, ClipboardError, EMPTY_TEXT_ERROR};
+
+    #[test]
+    fn empty_text_is_rejected_as_a_clipboard_write() {
+        assert!(matches!(
+            validate_text_to_clipboard(""),
+            Err(ClipboardError::Clipboard(message)) if message == EMPTY_TEXT_ERROR
+        ));
     }
 }
