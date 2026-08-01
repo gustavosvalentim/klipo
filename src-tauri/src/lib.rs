@@ -41,9 +41,12 @@ pub fn run() {
             save_shortcuts,
         ])
         .setup(|app| {
-            let log_directory = app.path().app_log_dir()?;
-            logging::init(&log_directory)?;
-            info!(log_directory:debug = log_directory; "Application logging initialized");
+            // Logging is best-effort and must not prevent the app from starting.
+            if let Ok(log_directory) = app.path().app_log_dir() {
+                if logging::init(&log_directory).is_ok() {
+                    info!(log_directory:debug = log_directory; "Application logging initialized");
+                }
+            }
             info!("Application starting");
 
             #[cfg(target_os = "macos")]
@@ -87,5 +90,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .unwrap_or_else(|error_value| {
             error!(error:debug = error_value; "Tauri application stopped with an error");
+            std::process::exit(1);
         });
 }
