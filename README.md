@@ -21,6 +21,7 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 - Floating, always-on-top clipboard menu.
 - Tray icon with Settings so the app can stay resident in the background.
 - Persistent SQLite history capped at 120 text and image items.
+- Rotating structured JSON logs for application diagnostics.
 
 ## ⌨️ Usage
 
@@ -32,7 +33,7 @@ Linux and Windows support is TBD. Some code paths exist for those platforms, but
 
 Open **Settings…** from the tray menu to record and save replacement key combinations. Only the Open Klipo shortcut is global; navigation, paste, and delete shortcuts apply while the picker is focused. Escape is fixed and cannot be changed.
 
-Klipo captures text and images. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History metadata is stored in SQLite, while full-resolution image bytes are stored as files alongside it in the application data directory. History is restored across app restarts, and clipboard content is never written to logs or the network.
+Klipo captures text and images. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History metadata is stored in SQLite, while full-resolution image bytes are stored as files alongside it in the application data directory. History is restored across app restarts, and clipboard content is never written to logs or the network. Diagnostic logs are stored as structured JSON in Tauri's app log directory, with five rotated 5 MiB files retained.
 
 ## 🗺️ Roadmap
 
@@ -40,7 +41,7 @@ The following work is planned to evolve Klipo from a macOS text clipboard utilit
 
 - [x] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
 - [x] **Persistent history between sessions** — Clipboard metadata is stored in SQLite and image bytes are stored as files in the application-data directory. Adding, reordering, deleting, and clearing items update persistent storage, with retention capped at 120 items.
-- [ ] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating log files so issues can be investigated after Klipo has been running.
+- [x] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating structured JSON log files so issues can be investigated after Klipo has been running.
 - [ ] **Linux support** — Replace macOS-specific window-focus and paste behavior with Linux-compatible implementations, verify clipboard monitoring and global shortcuts across the supported desktop environments, and provide Linux build/install artifacts.
 - [ ] **Windows support** — Implement Windows focus restoration and paste behavior, validate the picker, tray, global shortcut, and clipboard monitoring on Windows, and provide Windows release artifacts.
 

@@ -1,4 +1,5 @@
 use enigo::Mouse;
+use log::{error, warn};
 use tauri::{LogicalPosition, LogicalSize, Manager, Position, WebviewWindow};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 
@@ -6,6 +7,7 @@ use crate::settings::ShortcutSettings;
 use crate::state::AppState;
 use crate::window::{capture_focused_window, get_main_window};
 
+#[derive(Debug)]
 pub enum ShortcutError {
     InputError,
     PoisonError,
@@ -38,16 +40,19 @@ fn global_shortcut_bindings(
 
 fn show_on_cursor_handler(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
-    if let Err(e) = capture_focused_window(&state) {
-        println!("Failed to get and store window state: {e}");
+    if let Err(error_value) = capture_focused_window(&state) {
+        error!(error:debug = error_value; "Failed to get and store window state");
     }
 
     let Some(window) = get_main_window(app) else {
-        println!("Failed to get main window");
+        error!("Failed to get main window");
         return;
     };
 
-    let (mouse_x, mouse_y) = get_cursor_position(app).unwrap_or((0, 0));
+    let (mouse_x, mouse_y) = get_cursor_position(app).unwrap_or_else(|error_value| {
+        warn!(error:debug = error_value; "Failed to get cursor position; using origin");
+        (0, 0)
+    });
 
     // TODO: handle multi monitor setups
     // Enigo uses logical coordinates. For reference, see:
@@ -60,8 +65,8 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
     let y = f64::from(mouse_y).clamp(0.0, monitor_size.height - window_size.height);
     let window_position = LogicalPosition { x, y };
 
-    if let Err(e) = window.set_position(Position::Logical(window_position)) {
-        println!("Failed to position window: {:?}", e);
+    if let Err(error_value) = window.set_position(Position::Logical(window_position)) {
+        error!(error:debug = error_value; "Failed to position window");
         return;
     }
 
@@ -74,12 +79,12 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        if let Err(e) = window.show() {
-            println!("Failed to show window: {e}")
+        if let Err(error_value) = window.show() {
+            error!(error:debug = error_value; "Failed to show window");
         }
 
-        if let Err(e) = window.set_focus() {
-            println!("Failed to focus window: {e}")
+        if let Err(error_value) = window.set_focus() {
+            error!(error:debug = error_value; "Failed to focus window");
         }
     });
 }
@@ -116,8 +121,8 @@ fn register_saved_or_default(app: &tauri::AppHandle, saved: ShortcutSettings) ->
     }
 
     let defaults = ShortcutSettings::default();
-    if let Err(error) = register_global_shortcuts(app, &defaults) {
-        println!("Failed to register default shortcut: {error}");
+    if let Err(error_value) = register_global_shortcuts(app, &defaults) {
+        error!(error:% = error_value; "Failed to register default shortcut");
     }
     defaults
 }
@@ -242,9 +247,11 @@ pub fn settings_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, tauri
 fn global_shortcut_handler(app: &tauri::AppHandle, shortcut: &Shortcut, event: ShortcutEvent) {
     let state = app.state::<AppState>();
     let Ok(settings) = state.shortcuts.lock() else {
+        error!("Failed to lock shortcut settings");
         return;
     };
     let Ok(bindings) = global_shortcut_bindings(&settings) else {
+        error!("Failed to load shortcut bindings");
         return;
     };
     let action = bindings

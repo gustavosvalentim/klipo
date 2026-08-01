@@ -145,7 +145,7 @@ pub fn get_focused_window() -> Option<i32> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Not implemented");
+        log::warn!(platform = std::env::consts::OS; "Focused window lookup is not implemented");
         None
     }
 }
@@ -160,7 +160,7 @@ pub fn set_focused_window(pid: i32) -> bool {
 
     #[cfg(not(target_os = "macos"))]
     {
-        println!("Not implemented");
+        log::warn!(platform = std::env::consts::OS; "Focused window restoration is not implemented");
         false
     }
 }

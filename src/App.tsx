@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Trash2 } from "react-feather";
 import { ListItem } from "./components/ListItem";
+import { logError } from "./log";
 import "./App.css";
 
 type ClipboardItem = {
@@ -75,14 +76,18 @@ function App() {
 
 	const historyRef = useRef<HTMLDivElement>(null);
 
-	const hide = useCallback(() => invoke("close"), []);
+	const hide = useCallback(() => {
+		void invoke("close").catch((error) =>
+			logError("Failed to close picker", error),
+		);
+	}, []);
 
 	const fetchClipboardHistory = useCallback(async () => {
 		try {
 			const clipboard = await invoke<ClipboardItem[]>("fetch_clipboard");
 			setClipboard(clipboard);
 		} catch (error) {
-			console.error("Failed to get clipboard history", error);
+			logError("Failed to get clipboard history", error);
 		}
 	}, []);
 
@@ -90,7 +95,7 @@ function App() {
 		try {
 			await invoke("clear");
 		} catch (error) {
-			console.error("Failed to clear clipboard history", error);
+			logError("Failed to clear clipboard history", error);
 		}
 	}, []);
 
@@ -98,13 +103,17 @@ function App() {
 		try {
 			await invoke("paste", { hash });
 		} catch (error) {
-			console.error("Failed to paste from selection", error);
+			logError("Failed to paste from selection", error);
 		}
 	}, []);
 
 	const deleteItem = useCallback(async (hash: string) => {
-		await invoke("delete_item", { hash });
-		setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
+		try {
+			await invoke("delete_item", { hash });
+			setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
+		} catch (error) {
+			logError("Failed to delete clipboard item", error);
+		}
 	}, []);
 
 	const actionsMenuItems = [
@@ -195,7 +204,7 @@ function App() {
 		fetchClipboardHistory();
 		invoke<ShortcutSettings>("get_shortcuts")
 			.then(setShortcuts)
-			.catch(console.error);
+			.catch((error) => logError("Failed to get keyboard shortcuts", error));
 	}, [fetchClipboardHistory]);
 
 	useEffect(() => {
@@ -271,7 +280,10 @@ function SettingsView() {
 					setSaved(settings);
 					setDraft(settings);
 				})
-				.catch((reason) => setError(String(reason))),
+				.catch((reason) => {
+					logError("Failed to load keyboard shortcuts", reason);
+					setError(String(reason));
+				}),
 		[],
 	);
 
@@ -288,7 +300,9 @@ function SettingsView() {
 			event.stopPropagation();
 			if (event.key === "Escape") {
 				setRecording(null);
-				getCurrentWindow().hide().catch(console.error);
+				getCurrentWindow()
+					.hide()
+					.catch((error) => logError("Failed to hide settings window", error));
 				return;
 			}
 			const shortcut = shortcutFromEvent(event);
@@ -323,6 +337,7 @@ function SettingsView() {
 			setDraft(updated);
 			setError(null);
 		} catch (reason) {
+			logError("Failed to save keyboard shortcuts", reason);
 			setError(String(reason));
 		}
 	};

@@ -1,3 +1,4 @@
+use log::error;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 
@@ -32,8 +33,8 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
             app.exit(0);
         }
         "settings" => {
-            if let Err(error) = show_settings_window(app) {
-                println!("Failed to show settings: {error}");
+            if let Err(error_value) = show_settings_window(app) {
+                error!(error:debug = error_value; "Failed to show settings");
             }
         }
         _ => {}
