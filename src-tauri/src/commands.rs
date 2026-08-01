@@ -2,7 +2,7 @@ use std::vec::Vec;
 
 use tauri::image::Image;
 use tauri::{AppHandle, State};
-use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_clipboard_manager::{ClipboardExt, Result as ClipboardResult};
 
 use crate::clipboard::{ClipboardEventsEmitter, ClipboardImage, ClipboardItem};
 use crate::input::simulate_paste_input;
@@ -65,82 +65,61 @@ pub fn clear(app: AppHandle, state: State<'_, AppState>) {
     }
 }
 
-/// Outcome of a paste decision: whether to continue with the paste flow or abort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PasteOutcome {
-    Continue,
-    Abort,
+/// Write text to the system clipboard. Empty text is skipped.
+fn write_text_to_clipboard(app: &AppHandle, text: &str) -> ClipboardResult<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    app.clipboard().write_text(text)
 }
 
-/// Outcome of writing the new first item to the clipboard after deletion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FirstItemReplacementOutcome {
-    Written,
-    NoItem,
+/// Write an image to the system clipboard.
+fn write_image_to_clipboard(
+    app: &AppHandle,
+    image: &ClipboardImage,
+    fallback: &str,
+) -> ClipboardResult<()> {
+    let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
+
+    app.clipboard().write_image(&img).or_else(|e| {
+        println!("Failed to write image to clipboard: {e}");
+        write_text_to_clipboard(app, fallback)
+    })
 }
 
-/// Write the new first item to the system clipboard after the previous first
-/// item was deleted.
+/// Write a clipboard item's content to the system clipboard.
 ///
-/// Returns `FirstItemReplacementOutcome::Written` after successfully writing
-/// the item's primary content (or fallback text if image writing fails), or
-/// `FirstItemReplacementOutcome::NoItem` if no item remains or nothing was
-/// written.
-///
-/// The `write_image` and `write_text` closures allow testing the decision logic
-/// without a real system clipboard.
-pub(crate) fn perform_first_item_replacement(
-    item: Option<&ClipboardItem>,
-    write_image: impl FnOnce(&ClipboardImage) -> bool,
-    write_text: impl FnOnce(&str) -> bool,
-) -> FirstItemReplacementOutcome {
-    let Some(item) = item else {
-        return FirstItemReplacementOutcome::NoItem;
-    };
-
-    let wrote = match item.image.as_ref() {
-        Some(image) => write_image(image) || (!item.text.is_empty() && write_text(&item.text)),
-        None => !item.text.is_empty() && write_text(&item.text),
-    };
-
-    if wrote {
-        FirstItemReplacementOutcome::Written
-    } else {
-        FirstItemReplacementOutcome::NoItem
+/// Writes the item's image if present, falling back to the item's text if
+/// there is no image or image writing fails. Clipboard writes replace the
+/// whole contents, so only one of the two ends up written.
+pub(crate) fn write_to_clipboard(app: &AppHandle, item: &ClipboardItem) -> ClipboardResult<()> {
+    match item.image.as_ref() {
+        Some(image) => write_image_to_clipboard(app, image, &item.text),
+        None => write_text_to_clipboard(app, &item.text),
     }
 }
 
-/// Decide whether and what clipboard content to write for a paste action.
-///
-/// Returns `PasteOutcome::Continue` after successfully writing content to the
-/// clipboard, or `PasteOutcome::Abort` if nothing could be written.
-///
-/// The `write_image` and `write_text` closures allow testing the decision logic
-/// without a real system clipboard.
-pub(crate) fn perform_paste_decision(
-    item: &ClipboardItem,
-    write_image: impl FnOnce(&ClipboardImage) -> bool,
-    write_text: impl FnOnce(&str) -> bool,
-) -> PasteOutcome {
-    let wrote = match item.image.as_ref() {
-        Some(image) => write_image(image) || (!item.text.is_empty() && write_text(&item.text)),
-        None => !item.text.is_empty() && write_text(&item.text),
+#[tauri::command]
+pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
+    let Some(item) = state.clipboard.get_by_hash(hash) else {
+        return;
     };
-    if wrote {
-        PasteOutcome::Continue
-    } else {
-        PasteOutcome::Abort
-    }
-}
 
-fn perform_paste_flow(app: &AppHandle, state: &AppState) {
-    if let Some(window) = get_main_window(app) {
+    if let Err(e) = write_to_clipboard(&app, &item) {
+        println!("Failed to write item to clipboard: {e}");
+        return;
+    }
+
+    let _ = state.clipboard.move_to_top_by_hash(hash);
+
+    if let Some(window) = get_main_window(&app) {
         if window.hide().is_err() {
             println!("Failed to hide window");
         }
     }
 
-    if restore_focused_window(state).is_err() {
+    if restore_focused_window(&state).is_err() {
         println!("Failed to restore focus");
         return;
     }
@@ -156,24 +135,6 @@ fn perform_paste_flow(app: &AppHandle, state: &AppState) {
     };
 
     let _ = simulate_paste_input(enigo);
-}
-
-#[tauri::command]
-pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
-    let Some(item) = state.clipboard.get_by_hash(hash) else {
-        return;
-    };
-
-    let write_image = |image: &ClipboardImage| -> bool {
-        let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
-        app.clipboard().write_image(&img).is_ok()
-    };
-    let write_text = |text: &str| -> bool { app.clipboard().write_text(text).is_ok() };
-
-    if perform_paste_decision(&item, write_image, write_text) == PasteOutcome::Continue {
-        let _ = state.clipboard.move_to_top_by_hash(hash);
-        perform_paste_flow(&app, &state);
-    }
 }
 
 #[tauri::command]
@@ -220,237 +181,10 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
     }
 
     if item_idx == 0 {
-        let write_image = |image: &ClipboardImage| -> bool {
-            let img = Image::new_owned(image.rgba.clone(), image.width, image.height);
-            if app.clipboard().write_image(&img).is_ok() {
-                true
-            } else {
-                println!("Failed to write image to clipboard");
-                false
+        if let Some(item) = state.clipboard.first() {
+            if let Err(e) = write_to_clipboard(&app, &item) {
+                println!("Failed to write first item to clipboard: {e}");
             }
-        };
-        let write_text = |text: &str| -> bool {
-            if app.clipboard().write_text(text).is_ok() {
-                true
-            } else {
-                println!("Failed to write text to clipboard");
-                false
-            }
-        };
-        perform_first_item_replacement(state.clipboard.first().as_ref(), write_image, write_text);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::clipboard::ClipboardImage;
-
-    fn image(byte: u8) -> ClipboardImage {
-        ClipboardImage::from_rgba(vec![byte; 4], 1, 1).unwrap()
-    }
-
-    #[test]
-    fn decision_image_write_success_continues() {
-        let item = ClipboardItem {
-            text: String::new(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| true, |_| false);
-        assert_eq!(outcome, PasteOutcome::Continue);
-    }
-
-    #[test]
-    fn decision_image_write_failure_with_fallback_continues() {
-        let item = ClipboardItem {
-            text: "alt text".into(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| false, |_| true);
-        assert_eq!(outcome, PasteOutcome::Continue);
-    }
-
-    #[test]
-    fn decision_image_write_failure_no_fallback_aborts() {
-        let item = ClipboardItem {
-            text: String::new(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| false, |_| false);
-        assert_eq!(outcome, PasteOutcome::Abort);
-    }
-
-    #[test]
-    fn decision_text_write_success_continues() {
-        let item = ClipboardItem {
-            text: "hello".into(),
-            hash: "text:def".into(),
-            image: None,
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| false, |_| true);
-        assert_eq!(outcome, PasteOutcome::Continue);
-    }
-
-    #[test]
-    fn decision_text_write_failure_aborts() {
-        let item = ClipboardItem {
-            text: "hello".into(),
-            hash: "text:def".into(),
-            image: None,
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| false, |_| false);
-        assert_eq!(outcome, PasteOutcome::Abort);
-    }
-
-    #[test]
-    fn decision_empty_item_aborts() {
-        let item = ClipboardItem {
-            text: String::new(),
-            hash: "empty".into(),
-            image: None,
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(&item, |_| false, |_| false);
-        assert_eq!(outcome, PasteOutcome::Abort);
-    }
-
-    #[test]
-    fn decision_image_success_does_not_fall_back_to_text() {
-        let mut text_written = false;
-        let item = ClipboardItem {
-            text: "fallback".into(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_paste_decision(
-            &item,
-            |_| true,
-            |_| {
-                text_written = true;
-                true
-            },
-        );
-
-        // Image success should not call text write at all
-        assert_eq!(outcome, PasteOutcome::Continue);
-        assert!(
-            !text_written,
-            "text write should not be called when image succeeds"
-        );
-    }
-
-    // --- first-item-replacement tests ---
-
-    #[test]
-    fn replacement_image_success_writes_image() {
-        let item = ClipboardItem {
-            text: "fallback".into(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(Some(&item), |_| true, |_| false);
-        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
-    }
-
-    #[test]
-    fn replacement_image_failure_falls_back_to_text() {
-        let item = ClipboardItem {
-            text: "alt text".into(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| true);
-        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
-    }
-
-    #[test]
-    fn replacement_image_failure_no_fallback_returns_no_item() {
-        let item = ClipboardItem {
-            text: String::new(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| false);
-        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
-    }
-
-    #[test]
-    fn replacement_text_success_writes_text() {
-        let item = ClipboardItem {
-            text: "hello".into(),
-            hash: "text:def".into(),
-            image: None,
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| true);
-        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
-    }
-
-    #[test]
-    fn replacement_text_failure_returns_no_item() {
-        let item = ClipboardItem {
-            text: "hello".into(),
-            hash: "text:def".into(),
-            image: None,
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(Some(&item), |_| false, |_| false);
-        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
-    }
-
-    #[test]
-    fn replacement_no_item_returns_no_item() {
-        let outcome = perform_first_item_replacement(None, |_| true, |_| true);
-        assert_eq!(outcome, FirstItemReplacementOutcome::NoItem);
-    }
-
-    #[test]
-    fn replacement_image_success_does_not_fall_back_to_text() {
-        let mut text_written = false;
-        let item = ClipboardItem {
-            text: "fallback".into(),
-            hash: "image:abc".into(),
-            image: Some(image(0x42)),
-            preview: None,
-        };
-
-        let outcome = perform_first_item_replacement(
-            Some(&item),
-            |_| true,
-            |_| {
-                text_written = true;
-                true
-            },
-        );
-
-        assert_eq!(outcome, FirstItemReplacementOutcome::Written);
-        assert!(
-            !text_written,
-            "text write should not be called when image succeeds"
-        );
+        }
     }
 }
