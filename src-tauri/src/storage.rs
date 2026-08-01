@@ -60,7 +60,7 @@ impl ClipboardStore {
     }
 
     #[cfg(test)]
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 

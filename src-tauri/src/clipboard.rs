@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use clipboard_master::{CallbackResult, ClipboardHandler, Master};
+use clipboard_rs::common::RustImage;
+use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat, RustImageData};
 use log::{debug, error};
 use tauri::{Emitter, Manager};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 
 use crate::state::AppState;
 use crate::window::get_focused_window;
@@ -31,6 +32,121 @@ impl ClipboardImage {
             width,
             height,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemClipboardError {
+    Initialization,
+    Read,
+    LockPoisoned,
+}
+
+impl std::fmt::Display for SystemClipboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::Initialization => "Failed to initialize system clipboard",
+            Self::Read => "Failed to read system clipboard",
+            Self::LockPoisoned => "System clipboard lock is poisoned",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for SystemClipboardError {}
+
+#[derive(Debug, Default)]
+pub struct ClipboardSnapshot {
+    pub image: Option<ClipboardImage>,
+    pub text: Option<String>,
+}
+
+trait ClipboardBackend: Send {
+    fn get(&self, formats: &[ContentFormat])
+        -> Result<Vec<ClipboardContent>, SystemClipboardError>;
+}
+
+struct NativeClipboardBackend {
+    context: ClipboardContext,
+}
+
+impl ClipboardBackend for NativeClipboardBackend {
+    fn get(
+        &self,
+        formats: &[ContentFormat],
+    ) -> Result<Vec<ClipboardContent>, SystemClipboardError> {
+        self.context
+            .get(formats)
+            .map_err(|_| SystemClipboardError::Read)
+    }
+}
+
+pub struct SystemClipboard {
+    context: std::sync::Mutex<Box<dyn ClipboardBackend>>,
+}
+
+impl SystemClipboard {
+    pub fn new() -> Result<Self, SystemClipboardError> {
+        let context = ClipboardContext::new().map_err(|_| SystemClipboardError::Initialization)?;
+        Ok(Self {
+            context: std::sync::Mutex::new(Box::new(NativeClipboardBackend { context })),
+        })
+    }
+
+    pub fn read(&self) -> Result<ClipboardSnapshot, SystemClipboardError> {
+        let contents = {
+            let context = self
+                .context
+                .lock()
+                .map_err(|_| SystemClipboardError::LockPoisoned)?;
+            context.get(&[ContentFormat::Image, ContentFormat::Text])?
+        };
+
+        Ok(snapshot_from_contents(contents))
+    }
+
+    #[cfg(test)]
+    fn from_backend(backend: impl ClipboardBackend + 'static) -> Self {
+        Self {
+            context: std::sync::Mutex::new(Box::new(backend)),
+        }
+    }
+}
+
+fn snapshot_from_contents(contents: Vec<ClipboardContent>) -> ClipboardSnapshot {
+    let mut snapshot = ClipboardSnapshot::default();
+
+    for content in contents {
+        match content {
+            ClipboardContent::Image(image) if snapshot.image.is_none() => {
+                snapshot.image = clipboard_image_from_rust(image);
+            }
+            ClipboardContent::Text(text) if snapshot.text.is_none() && !text.is_empty() => {
+                snapshot.text = Some(text);
+            }
+            _ => {}
+        }
+    }
+
+    snapshot
+}
+
+fn clipboard_image_from_rust(image: RustImageData) -> Option<ClipboardImage> {
+    let (width, height) = image.get_size();
+    let rgba = image.to_rgba8().ok()?.into_raw();
+    ClipboardImage::from_rgba(rgba, width, height)
+}
+
+fn store_snapshot(
+    store: &crate::storage::ClipboardStore,
+    snapshot: ClipboardSnapshot,
+) -> Result<bool, crate::storage::ClipboardError> {
+    match snapshot.image {
+        Some(image) => store.try_add_image(image, snapshot.text),
+        None => match snapshot.text {
+            Some(text) => store.try_add_text(text),
+            None => Ok(false),
+        },
     }
 }
 
@@ -82,21 +198,16 @@ impl ClipboardHandler for ClipboardEventsHandler {
             }
         }
 
-        let image = self.app.clipboard().read_image().ok().and_then(|image| {
-            ClipboardImage::from_rgba(image.rgba().to_vec(), image.width(), image.height())
-        });
-        let text = self.app.clipboard().read_text().ok();
-
         let state = self.app.state::<AppState>();
-        let store = &state.clipboard;
-
-        let accepted = match image {
-            Some(image) => store.try_add_image(image, text),
-            None => match text {
-                Some(text) => store.try_add_text(text),
-                None => Ok(false),
-            },
+        let snapshot = match state.system_clipboard.read() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                error!(error:% = error; "Failed to read system clipboard");
+                return CallbackResult::Next;
+            }
         };
+
+        let accepted = store_snapshot(&state.clipboard, snapshot);
 
         match accepted {
             Ok(true) => {
@@ -163,5 +274,157 @@ pub trait ClipboardEventsEmitter {
 impl ClipboardEventsEmitter for tauri::AppHandle {
     fn emit_clipboard_changed(&self) -> Result<(), tauri::Error> {
         self.emit(CLIPBOARD_CHANGED_EVENT, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        store_snapshot, ClipboardBackend, ClipboardContent, ClipboardSnapshot, ContentFormat,
+        RustImage, RustImageData, SystemClipboard, SystemClipboardError,
+    };
+    use crate::storage::ClipboardStore;
+    use image::{DynamicImage, RgbaImage};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeClipboard {
+        responses: Mutex<VecDeque<Result<Vec<ClipboardContent>, SystemClipboardError>>>,
+        requested_formats: Arc<Mutex<Vec<(bool, bool)>>>,
+    }
+
+    impl FakeClipboard {
+        fn new(
+            responses: Vec<Result<Vec<ClipboardContent>, SystemClipboardError>>,
+        ) -> (Self, Arc<Mutex<Vec<(bool, bool)>>>) {
+            let requested_formats = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into()),
+                    requested_formats: Arc::clone(&requested_formats),
+                },
+                requested_formats,
+            )
+        }
+    }
+
+    impl ClipboardBackend for FakeClipboard {
+        fn get(
+            &self,
+            formats: &[ContentFormat],
+        ) -> Result<Vec<ClipboardContent>, SystemClipboardError> {
+            let has_image = formats
+                .iter()
+                .any(|format| matches!(format, ContentFormat::Image));
+            let has_text = formats
+                .iter()
+                .any(|format| matches!(format, ContentFormat::Text));
+            self.requested_formats
+                .lock()
+                .unwrap()
+                .push((has_image, has_text));
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+    }
+
+    fn rust_image(rgba: Vec<u8>, width: u32, height: u32) -> RustImageData {
+        let image = RgbaImage::from_raw(width, height, rgba).unwrap();
+        RustImageData::from_dynamic_image(DynamicImage::ImageRgba8(image))
+    }
+
+    #[test]
+    fn reads_text_only_content() {
+        let (backend, requested_formats) =
+            FakeClipboard::new(vec![Ok(vec![ClipboardContent::Text("hello".into())])]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        let snapshot = clipboard.read().unwrap();
+
+        assert_eq!(snapshot.text.as_deref(), Some("hello"));
+        assert!(snapshot.image.is_none());
+        assert_eq!(*requested_formats.lock().unwrap(), vec![(true, true)]);
+    }
+
+    #[test]
+    fn reads_image_only_content_without_changing_pixels_or_dimensions() {
+        let rgba = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let (backend, _) = FakeClipboard::new(vec![Ok(vec![ClipboardContent::Image(rust_image(
+            rgba.clone(),
+            2,
+            1,
+        ))])]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        let snapshot = clipboard.read().unwrap();
+        let image = snapshot.image.unwrap();
+
+        assert_eq!(image.rgba, rgba);
+        assert_eq!((image.width, image.height), (2, 1));
+        assert!(snapshot.text.is_none());
+    }
+
+    #[test]
+    fn reads_image_and_text_as_one_snapshot() {
+        let (backend, _) = FakeClipboard::new(vec![Ok(vec![
+            ClipboardContent::Image(rust_image(vec![1, 2, 3, 4], 1, 1)),
+            ClipboardContent::Text("fallback".into()),
+        ])]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        let snapshot = clipboard.read().unwrap();
+
+        assert_eq!(snapshot.text.as_deref(), Some("fallback"));
+        assert_eq!(snapshot.image.unwrap().rgba, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn ignores_empty_text_unsupported_content_and_invalid_images() {
+        let (backend, _) = FakeClipboard::new(vec![Ok(vec![
+            ClipboardContent::Text(String::new()),
+            ClipboardContent::Other("application/octet-stream".into(), vec![1, 2, 3]),
+            ClipboardContent::Image(RustImageData::empty()),
+        ])]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        let snapshot = clipboard.read().unwrap();
+
+        assert!(snapshot.text.is_none());
+        assert!(snapshot.image.is_none());
+    }
+
+    #[test]
+    fn keeps_available_content_when_another_representation_is_unavailable() {
+        let (backend, _) =
+            FakeClipboard::new(vec![Ok(vec![ClipboardContent::Text("available".into())])]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        let snapshot = clipboard.read().unwrap();
+
+        assert_eq!(snapshot.text.as_deref(), Some("available"));
+        assert!(snapshot.image.is_none());
+    }
+
+    #[test]
+    fn read_failure_does_not_poison_later_reads() {
+        let (backend, _) = FakeClipboard::new(vec![
+            Err(SystemClipboardError::Read),
+            Ok(vec![ClipboardContent::Text("later".into())]),
+        ]);
+        let clipboard = SystemClipboard::from_backend(backend);
+
+        assert!(matches!(clipboard.read(), Err(SystemClipboardError::Read)));
+        assert_eq!(clipboard.read().unwrap().text.as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn empty_snapshot_is_not_stored() {
+        let store = ClipboardStore::new();
+
+        assert!(!store_snapshot(&store, ClipboardSnapshot::default()).unwrap());
+        assert!(store.list().unwrap().is_empty());
     }
 }
