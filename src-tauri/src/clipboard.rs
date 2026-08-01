@@ -1,11 +1,12 @@
 use serde::Serialize;
-use std::io;
 use std::sync::Arc;
 use std::vec::Vec;
 
-use clipboard_master::{CallbackResult, ClipboardHandler, Master};
 use clipboard_rs::common::RustImage;
-use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat, RustImageData};
+use clipboard_rs::{
+    Clipboard, ClipboardContent, ClipboardContext, ClipboardHandler, ClipboardWatcher,
+    ClipboardWatcherContext, ContentFormat, RustImageData,
+};
 use log::{debug, error};
 use tauri::{Emitter, Manager};
 
@@ -150,6 +151,22 @@ fn store_snapshot(
     }
 }
 
+#[derive(Debug)]
+enum ClipboardCaptureError {
+    Read(SystemClipboardError),
+    Store(crate::storage::ClipboardError),
+}
+
+fn capture_clipboard_change(
+    system_clipboard: &SystemClipboard,
+    store: &crate::storage::ClipboardStore,
+) -> Result<bool, ClipboardCaptureError> {
+    let snapshot = system_clipboard
+        .read()
+        .map_err(ClipboardCaptureError::Read)?;
+    store_snapshot(store, snapshot).map_err(ClipboardCaptureError::Store)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipboardItem {
     pub text: String,
@@ -160,18 +177,33 @@ pub struct ClipboardItem {
     pub preview: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ClipboardWatcherInitializationError;
+
+impl std::fmt::Display for ClipboardWatcherInitializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Failed to initialize clipboard watcher")
+    }
+}
+
+impl std::error::Error for ClipboardWatcherInitializationError {}
+
 pub struct ClipboardEventsListener {
-    handler: Master<ClipboardEventsHandler>,
+    watcher: ClipboardWatcherContext<ClipboardEventsHandler>,
 }
 
 impl ClipboardEventsListener {
-    pub fn new(app_handler: tauri::AppHandle) -> Result<ClipboardEventsListener, std::io::Error> {
-        let handler = Master::new(ClipboardEventsHandler::new(Arc::new(app_handler)))?;
-        Ok(Self { handler })
+    pub fn new(
+        app_handler: tauri::AppHandle,
+    ) -> Result<ClipboardEventsListener, ClipboardWatcherInitializationError> {
+        let mut watcher =
+            ClipboardWatcherContext::new().map_err(|_| ClipboardWatcherInitializationError)?;
+        watcher.add_handler(ClipboardEventsHandler::new(Arc::new(app_handler)));
+        Ok(Self { watcher })
     }
 
-    pub fn start(mut self) -> Result<(), std::io::Error> {
-        self.handler.run()
+    pub fn start(mut self) {
+        self.watcher.start_watch();
     }
 }
 
@@ -186,7 +218,7 @@ impl ClipboardEventsHandler {
 }
 
 impl ClipboardHandler for ClipboardEventsHandler {
-    fn on_clipboard_change(&mut self) -> CallbackResult {
+    fn on_clipboard_change(&mut self) {
         debug!("Clipboard changed");
 
         let klipo_pid = std::process::id();
@@ -194,20 +226,12 @@ impl ClipboardHandler for ClipboardEventsHandler {
 
         if let Some(focused_window_pid) = focused_window_pid {
             if focused_window_pid as u32 == klipo_pid {
-                return CallbackResult::Next;
+                return;
             }
         }
 
         let state = self.app.state::<AppState>();
-        let snapshot = match state.system_clipboard.read() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                error!(error:% = error; "Failed to read system clipboard");
-                return CallbackResult::Next;
-            }
-        };
-
-        let accepted = store_snapshot(&state.clipboard, snapshot);
+        let accepted = capture_clipboard_change(&state.system_clipboard, &state.clipboard);
 
         match accepted {
             Ok(true) => {
@@ -216,15 +240,13 @@ impl ClipboardHandler for ClipboardEventsHandler {
                 }
             }
             Ok(false) => {}
-            Err(error) => error!(error:debug = error; "Failed to store clipboard item"),
+            Err(ClipboardCaptureError::Read(error)) => {
+                error!(error:% = error; "Failed to read system clipboard");
+            }
+            Err(ClipboardCaptureError::Store(error)) => {
+                error!(error:debug = error; "Failed to store clipboard item");
+            }
         }
-
-        CallbackResult::Next
-    }
-
-    fn on_clipboard_error(&mut self, error: io::Error) -> CallbackResult {
-        error!(error:debug = error; "Clipboard error");
-        CallbackResult::Next
     }
 }
 
@@ -280,8 +302,9 @@ impl ClipboardEventsEmitter for tauri::AppHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        store_snapshot, ClipboardBackend, ClipboardContent, ClipboardSnapshot, ContentFormat,
-        RustImage, RustImageData, SystemClipboard, SystemClipboardError,
+        capture_clipboard_change, store_snapshot, ClipboardBackend, ClipboardCaptureError,
+        ClipboardContent, ClipboardSnapshot, ContentFormat, RustImage, RustImageData,
+        SystemClipboard, SystemClipboardError,
     };
     use crate::storage::ClipboardStore;
     use image::{DynamicImage, RgbaImage};
@@ -426,5 +449,37 @@ mod tests {
 
         assert!(!store_snapshot(&store, ClipboardSnapshot::default()).unwrap());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn capture_flow_ignores_empty_content_and_accepts_the_next_change() {
+        let (backend, _) = FakeClipboard::new(vec![
+            Ok(Vec::new()),
+            Ok(vec![ClipboardContent::Text("later".into())]),
+        ]);
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.first().unwrap().text, "later");
+    }
+
+    #[test]
+    fn capture_flow_recovers_after_a_read_failure() {
+        let (backend, _) = FakeClipboard::new(vec![
+            Err(SystemClipboardError::Read),
+            Ok(vec![ClipboardContent::Text("recovered".into())]),
+        ]);
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        assert!(matches!(
+            capture_clipboard_change(&system_clipboard, &store),
+            Err(ClipboardCaptureError::Read(SystemClipboardError::Read))
+        ));
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "recovered");
     }
 }
