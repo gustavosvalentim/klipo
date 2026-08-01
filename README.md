@@ -1,147 +1,67 @@
-# 📋 Klipo
+# Klipo
 
-Klipo is a small clipboard history app built with Tauri, React, TypeScript, and Rust.
+Klipo is a macOS clipboard manager built with Tauri, React, TypeScript, and Rust. It stores recent text and image clipboard entries and provides a floating picker for selecting and pasting them.
 
-It runs as a lightweight desktop utility: copy text normally, open Klipo with a global shortcut, choose a previous clipboard item, and paste it back into the app you were using.
+## Features
 
-## 🍎 Platform support
+- Text and image clipboard history
+- Persistent history stored locally
+- Global shortcut to open the picker
+- Configurable picker shortcuts
+- Menu bar resident mode
+- Rotating JSON diagnostic logs
 
-Klipo is currently macOS-focused.
+Klipo currently supports macOS only. Linux and Windows support are not implemented.
 
-Several parts of the app depend on macOS-specific behavior, including private Tauri macOS APIs, AppKit window focus handling, accessory app mode, a translucent floating window, and simulated paste behavior using the macOS command key.
+## Install
 
-Linux and Windows support is TBD. Some code paths exist for those platforms, but the app should be treated as macOS-only until cross-platform behavior is implemented and tested.
+1. Download the latest `.dmg` from the [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
+2. Move Klipo to the Applications folder.
+3. Launch Klipo.
+4. Enable Klipo under **System Settings > Privacy & Security > Accessibility**.
+5. Restart Klipo.
 
-## ✨ Features
+Accessibility permission is required to paste into the previously active application.
 
-- Text and image clipboard history.
-- Compact image thumbnails in the picker, with full-resolution restore on paste.
-- Global shortcut to open the picker at the cursor position.
-- Configurable keyboard shortcuts, saved between app launches.
-- Floating, always-on-top clipboard menu.
-- Tray icon with Settings so the app can stay resident in the background.
-- Persistent SQLite history capped at 120 text and image items.
-- Rotating structured JSON logs for application diagnostics.
+## Usage
 
-## ⌨️ Usage
+- `Cmd+Shift+V`: open the picker
+- `Up` / `Down`: navigate entries
+- `Enter`: paste the selected entry
+- `Delete`: remove the selected entry
+- `Esc`: close the picker
 
-- `⌘⇧V`: show Klipo at the current cursor position.
-- `↑` / `↓`: move through clipboard items while the picker is focused.
-- `↩`: paste the selected item.
-- `⌦`: delete the selected item.
-- `Escape`: hide Klipo.
+Open **Settings** from the menu bar to change the picker shortcuts. Only the shortcut for opening Klipo is global.
 
-Open **Settings…** from the tray menu to record and save replacement key combinations. Only the Open Klipo shortcut is global; navigation, paste, and delete shortcuts apply while the picker is focused. Escape is fixed and cannot be changed.
+## Development
 
-Klipo captures text and images. Mixed image/text clipboard content becomes a single image entry with its text kept as a paste fallback. History metadata is stored in SQLite, while full-resolution image bytes are stored as files alongside it in the application data directory. History is restored across app restarts, and clipboard content is never written to logs or the network. Diagnostic logs are stored as structured JSON in Tauri's app log directory, with five rotated 5 MiB files retained.
+Requirements:
 
-## 🗺️ Roadmap
-
-The following work is planned to evolve Klipo from a macOS text clipboard utility into a cross-platform clipboard manager.
-
-- [x] **Image support** — Capture image clipboard entries alongside text, store the image data and metadata safely, show thumbnails in the picker, and restore the selected image to the system clipboard before pasting.
-- [x] **Persistent history between sessions** — Clipboard metadata is stored in SQLite and image bytes are stored as files in the application-data directory. Adding, reordering, deleting, and clearing items update persistent storage, with retention capped at 120 items.
-- [x] **File logging** — Write application events, errors, and platform-integration diagnostics to rotating structured JSON log files so issues can be investigated after Klipo has been running.
-- [ ] **Linux support** — Replace macOS-specific window-focus and paste behavior with Linux-compatible implementations, verify clipboard monitoring and global shortcuts across the supported desktop environments, and provide Linux build/install artifacts.
-- [ ] **Windows support** — Implement Windows focus restoration and paste behavior, validate the picker, tray, global shortcut, and clipboard monitoring on Windows, and provide Windows release artifacts.
-
-Cross-platform support depends on platform-specific focus restoration and input simulation: the current paste flow only fully supports macOS. The image history model and its commands are platform-neutral and share the same content model and command contract across desktop targets. On Linux and Windows, focus restoration, paste integration, and clipboard-change monitoring are not yet implemented or validated. On Linux specifically, clipboard monitoring relies on X11; native Wayland monitoring is not covered.
-
-## 📦 Install on macOS
-
-1. Open the [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases) and download the `.dmg` file for the latest release.
-2. Open the downloaded DMG, then drag **Klipo** into the **Applications** folder.
-3. Launch Klipo from Applications.
-4. Open **System Settings → Privacy & Security → Accessibility**, unlock the settings if prompted, and enable **Klipo**.
-5. Quit Klipo completely and open it again.
-
-Restarting Klipo after granting Accessibility access is a temporary workaround. It is currently needed for Klipo to simulate paste into the app that was previously active.
-
-## 🛠️ Development
-
-Prerequisites:
-
-- macOS.
-- Rust and Cargo.
-- Bun.
-- Tauri development dependencies for macOS.
-
-<details>
-<summary>Setup</summary>
+- macOS
+- Rust and Cargo
+- Bun
+- Tauri development dependencies for macOS
 
 ```sh
 bun install
-```
-
-</details>
-
-<details>
-<summary>Run the app locally</summary>
-
-Using Bun:
-
-```sh
 bun run tauri dev
 ```
 
-Using Cargo:
-
-```sh
-cargo tauri dev
-```
-
-Run only the frontend dev server:
-
-```sh
-bun run dev
-```
-
-</details>
-
-<details>
-<summary>Generate release binaries</summary>
-
-Using Bun:
+Build the application:
 
 ```sh
 bun run tauri build
 ```
 
-Using Cargo:
-
-```sh
-cargo tauri build
-```
-
-The generated app bundle and installer artifacts are written under `src-tauri/target/release/bundle/`.
-
-Build only the frontend assets:
+Build only the frontend:
 
 ```sh
 bun run build
 ```
 
-</details>
-
-<details>
-<summary>Format the project</summary>
-
-Format Rust code:
+Format the project:
 
 ```sh
 cargo fmt --manifest-path src-tauri/Cargo.toml
-```
-
-Format frontend code:
-
-```sh
 bun run format
 ```
-
-</details>
-
-## 🔐 macOS permissions
-
-Because Klipo listens for global shortcuts, tracks the clipboard, restores focus to the previous app, and simulates paste, macOS may require permissions such as Accessibility or Input Monitoring depending on your system settings.
-
-If the picker opens but cannot paste back into another app, check macOS System Settings privacy permissions for the built Klipo app or the development terminal running it.
