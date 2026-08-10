@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trash2 } from "react-feather";
+import { ClearHistoryButton } from "./components/ClearHistoryButton";
 import { ListItem } from "./components/ListItem";
 import { logError } from "./log";
 import "./App.css";
@@ -115,10 +115,6 @@ function App() {
 			logError("Failed to delete clipboard item", error);
 		}
 	}, []);
-
-	const actionsMenuItems = [
-		{ label: "Clear History", onClick: clearHistory, icon: Trash2 },
-	];
 
 	const clipboardMenuItems = useMemo(
 		() =>
@@ -242,16 +238,7 @@ function App() {
 					</div>
 
 					<div className="flex justify-right items-center">
-						{actionsMenuItems.map((item) => (
-							<button
-								type="button"
-								className="cursor-pointer p-1 rounded-md hover:bg-[#0a84ff]"
-								onClick={item.onClick}
-								key={item.label}
-							>
-								<item.icon className="w-4 h-4" />
-							</button>
-						))}
+						<ClearHistoryButton onClick={clearHistory} />
 					</div>
 				</div>
 
