@@ -59,6 +59,16 @@ Build only the frontend:
 bun run build
 ```
 
+Validate the frontend before opening a pull request:
+
+```sh
+bun install --frozen-lockfile
+bun run --no-install biome check
+bun run build
+```
+
+There is currently no frontend test command or Vitest test suite configured, so the frontend CI runs the checks above. Add a test command and test suite before enabling frontend tests in CI.
+
 Format the project:
 
 ```sh
