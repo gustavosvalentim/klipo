@@ -1,0 +1,38 @@
+name: Frontend CI
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/frontend-ci.yml"
+      - "package.json"
+      - "bun.lock"
+      - "biome.json"
+      - "vite.config.ts"
+      - "tsconfig.json"
+      - "tsconfig.node.json"
+      - "index.html"
+      - "src/**"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check formatting and linting
+        run: bun run --no-install biome check
+
+      - name: Build the frontend
+        run: bun run build
