@@ -15,11 +15,23 @@ Klipo currently supports macOS only. Linux and Windows support are not implement
 
 ## Install
 
+> [!WARNING]
+> Klipo's macOS DMG is unsigned and not notarized. Download it only from the official [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
+
 1. Download the latest `.dmg` from the [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
 2. Move Klipo to the Applications folder.
-3. Launch Klipo.
-4. Enable Klipo under **System Settings > Privacy & Security > Accessibility**.
-5. Restart Klipo.
+3. To open Klipo the first time, Control-click `Klipo.app` in Applications, choose **Open**, then choose **Open** again in the confirmation dialog.
+4. If macOS still blocks Klipo, go to **System Settings > Privacy & Security**, choose **Open Anyway** for Klipo, then confirm **Open**.
+5. If Klipo remains blocked after those steps and you downloaded it from the official GitHub release, remove the quarantine attribute only from the installed app:
+
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/Klipo.app"
+   ```
+
+   Do not disable Gatekeeper globally.
+6. Launch Klipo.
+7. Enable Klipo under **System Settings > Privacy & Security > Accessibility**.
+8. Restart Klipo.
 
 Accessibility permission is required to paste into the previously active application.
 

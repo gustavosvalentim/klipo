@@ -81,4 +81,7 @@ jobs:
 
           gh release create "$GITHUB_REF_NAME" "${dmg_files[@]}" \
             --title "$GITHUB_REF_NAME" \
+            --notes "## macOS installation notice
+
+          The attached DMG is unsigned and not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance." \
             --generate-notes
