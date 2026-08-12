@@ -150,12 +150,12 @@ pub fn get_focused_window() -> Option<i32> {
     }
 }
 
-pub fn set_focused_window(pid: i32) -> bool {
+pub fn set_focused_window(_pid: i32) -> bool {
     #[cfg(target_os = "macos")]
     {
         use crate::window::macos::set_focused_window;
 
-        set_focused_window(pid)
+        set_focused_window(_pid)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -182,27 +182,5 @@ mod macos {
         let app = workspace.frontmostApplication();
 
         Some(app?.processIdentifier())
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod linux {
-    pub fn set_focused_window(_pid: i32) -> bool {
-        false
-    }
-
-    pub fn get_focused_window() -> Option<i32> {
-        None
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod windows {
-    pub fn set_focused_window(_pid: i32) -> bool {
-        false
-    }
-
-    pub fn get_focused_window() -> Option<i32> {
-        None
     }
 }
