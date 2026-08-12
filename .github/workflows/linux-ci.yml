@@ -1,0 +1,93 @@
+name: Linux CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test on Ubuntu 22.04
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check frontend formatting
+        run: bun run --no-install biome check
+
+      - name: Build frontend
+        run: bun run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Check Rust compilation
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Verify x86_64 build host
+        shell: bash
+        run: |
+          if [[ "$(uname -m)" != "x86_64" ]]; then
+            echo "AppImage builds must run on x86_64; found $(uname -m)."
+            exit 1
+          fi
+
+      - name: Build unsigned AppImage
+        run: bun run tauri build -- --bundles appimage
+
+      - name: Locate AppImage
+        id: appimage
+        shell: bash
+        run: |
+          shopt -s nullglob
+          appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+
+          if (( ${#appimages[@]} != 1 )); then
+            echo "Expected exactly one AppImage, found ${#appimages[@]}."
+            exit 1
+          fi
+
+          echo "path=${appimages[0]}" >> "$GITHUB_OUTPUT"
+          echo "AppImage: ${appimages[0]}"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: klipo-linux-x86_64-appimage
+          path: ${{ steps.appimage.outputs.path }}
+          if-no-files-found: error
