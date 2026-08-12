@@ -66,13 +66,18 @@ pub fn save_shortcuts(
 
 #[tauri::command]
 pub fn clear(app: AppHandle, state: State<'_, AppState>) {
-    if let Err(error_value) = state.clipboard.clear() {
+    let clear_result = state.clipboard.clear();
+    if should_emit_clear_event(&clear_result) {
+        if let Err(error_value) = app.emit_clipboard_changed() {
+            error!(error:debug = error_value; "Failed to emit clipboard changed event");
+        }
+    } else if let Err(error_value) = clear_result {
         error!(error:debug = error_value; "Failed to clear clipboard history");
     }
+}
 
-    if let Err(error_value) = app.emit_clipboard_changed() {
-        error!(error:debug = error_value; "Failed to emit clipboard changed event");
-    }
+fn should_emit_clear_event(result: &Result<(), crate::storage::ClipboardError>) -> bool {
+    result.is_ok()
 }
 
 /// Write and verify a clipboard item's content before any paste side effects.
@@ -173,5 +178,17 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
                 error!(error:debug = error_value; "Failed to write first item to clipboard");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_emit_clear_event;
+    use crate::storage::ClipboardError;
+
+    #[test]
+    fn clear_event_is_emitted_only_after_a_committed_clear() {
+        assert!(should_emit_clear_event(&Ok(())));
+        assert!(!should_emit_clear_event(&Err(ClipboardError::ItemNotFound)));
     }
 }
