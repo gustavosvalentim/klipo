@@ -68,7 +68,7 @@ jobs:
           fi
 
       - name: Build unsigned AppImage
-        run: bun run tauri build -- --bundles appimage
+        run: bun run tauri build --bundles appimage
 
       - name: Locate AppImage
         id: appimage
