@@ -52,6 +52,16 @@ Klipo is a multi-platform clipboard manager for macOS.
 - Keep macOS-specific behavior behind appropriate target checks and avoid broad platform assumptions in shared code.
 - Avoid early returns. Prefer explicit control flows. Use early returns only on prechecks.
 
+### Readability
+
+- Use blank lines to separate logical steps, especially before control-flow blocks and around multi-line statements when they begin a new step.
+- Prefer descriptive names over generic names such as `data`, `value`, `result`, or `handler`.
+- Use intermediate variables instead of dense method chains or complex inline expressions.
+- Keep the main control flow easy to scan; use prechecks or small helpers to reduce nesting.
+- Keep functions focused on one level of abstraction and extract secondary details into named helpers.
+- Comments should explain intent, constraints, or surprising behavior, not restate the code.
+- Introduce traits and wrappers only when they represent a meaningful boundary or materially improve testability.
+
 ## Testing Guidelines
 
 - When fixing a bug, add a test case that reproduces the bug and fails without a fix.
