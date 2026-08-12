@@ -1,15 +1,18 @@
 use md5::{Digest, Md5};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
 use crate::clipboard::{generate_preview, ClipboardImage, ClipboardItem};
 
 const MAX_ITEMS: usize = 120;
+const RECONCILIATION_BATCH_SIZE: usize = 32;
+const RECONCILIATION_SCAN_LIMIT: usize = RECONCILIATION_BATCH_SIZE * 2;
 
 #[derive(Debug)]
 pub enum ClipboardError {
@@ -44,12 +47,26 @@ impl From<io::Error> for ClipboardError {
     }
 }
 
-#[derive(Debug)]
 pub struct ClipboardStore {
     connection: Mutex<Connection>,
     images_directory: PathBuf,
+    cleanup_lock: Mutex<()>,
+    reconciliation_entries: Mutex<Option<fs::ReadDir>>,
     #[cfg(test)]
     remove_images_on_drop: bool,
+    #[cfg(test)]
+    failures: Mutex<TestFailures>,
+    #[cfg(test)]
+    reconciliation_entries_consumed: Mutex<usize>,
+    #[cfg(test)]
+    reconciliation_snapshot_pause: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TestFailures {
+    fail_next_commit: bool,
+    fail_image_removal: bool,
 }
 
 impl ClipboardStore {
@@ -78,6 +95,7 @@ impl ClipboardStore {
         images_directory: PathBuf,
     ) -> Result<Self, ClipboardError> {
         fs::create_dir_all(&images_directory)?;
+        connection.busy_timeout(Duration::from_millis(100))?;
         connection.execute_batch(
             "PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS clipboard_items (
@@ -94,12 +112,22 @@ impl ClipboardStore {
         )?;
         migrate_sort_order(&mut connection)?;
 
-        Ok(Self {
+        let store = Self {
             connection: Mutex::new(connection),
             images_directory,
+            cleanup_lock: Mutex::new(()),
+            reconciliation_entries: Mutex::new(None),
             #[cfg(test)]
             remove_images_on_drop: false,
-        })
+            #[cfg(test)]
+            failures: Mutex::new(TestFailures::default()),
+            #[cfg(test)]
+            reconciliation_entries_consumed: Mutex::new(0),
+            #[cfg(test)]
+            reconciliation_snapshot_pause: Mutex::new(None),
+        };
+        store.reconcile_images_best_effort();
+        Ok(store)
     }
 
     pub fn get_by_hash(&self, hash: &str) -> Option<ClipboardItem> {
@@ -127,31 +155,43 @@ impl ClipboardStore {
     }
 
     pub fn delete_by_hash(&self, hash: &str) -> Result<usize, ClipboardError> {
+        let _cleanup_lock = self
+            .cleanup_lock
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
         let mut connection = self
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
-        let transaction = connection.transaction()?;
-        let stored_item: Option<(i64, Option<String>)> = transaction
-            .query_row(
-                "SELECT updated_at, image_file FROM clipboard_items WHERE hash = ?1",
-                [hash],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((updated_at, image_file)) = stored_item else {
-            return Err(ClipboardError::ItemNotFound);
+        let (index, image_file) = {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let stored_item: Option<(i64, Option<String>)> = transaction
+                .query_row(
+                    "SELECT updated_at, image_file FROM clipboard_items WHERE hash = ?1",
+                    [hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((updated_at, image_file)) = stored_item else {
+                return Err(ClipboardError::ItemNotFound);
+            };
+            let index = transaction.query_row(
+                "SELECT COUNT(*) FROM clipboard_items WHERE updated_at > ?1",
+                [updated_at],
+                |row| row.get::<_, usize>(0),
+            )?;
+            transaction.execute("DELETE FROM clipboard_items WHERE hash = ?1", [hash])?;
+            self.fail_before_commit()?;
+            transaction.commit()?;
+            (index, image_file)
         };
-        let index = transaction.query_row(
-            "SELECT COUNT(*) FROM clipboard_items WHERE updated_at > ?1",
-            [updated_at],
-            |row| row.get::<_, usize>(0),
-        )?;
-        transaction.execute("DELETE FROM clipboard_items WHERE hash = ?1", [hash])?;
-        transaction.commit()?;
+        drop(connection);
+
         if let Some(image_file) = image_file {
-            remove_file_if_exists(&self.images_directory.join(image_file))?;
+            self.remove_unreferenced_image_file_best_effort(&image_file);
         }
+        self.reconcile_images_locked_best_effort();
 
         Ok(index)
     }
@@ -231,6 +271,10 @@ impl ClipboardStore {
         image: Option<ClipboardImage>,
         text: Option<String>,
     ) -> Result<bool, ClipboardError> {
+        let _cleanup_lock = self
+            .cleanup_lock
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
         let text = text.filter(|text| !text.is_empty());
         let hash = match image.as_ref() {
             Some(image) => Self::hash_image(image),
@@ -244,18 +288,30 @@ impl ClipboardStore {
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
-        let image_file = match image.as_ref() {
-            Some(image) => Some(self.write_image(&hash, image)?),
-            None => None,
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_image_file: Option<String> = transaction
+            .query_row(
+                "SELECT image_file FROM clipboard_items WHERE hash = ?1",
+                [&hash],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let (image_file, wrote_image) = match image.as_ref() {
+            Some(image) => match existing_image_file {
+                Some(image_file) => (Some(image_file), false),
+                None => (Some(self.write_image(&hash, image)?), true),
+            },
+            None => (None, false),
         };
-        let transaction = connection.transaction()?;
         let updated_at = now_ns();
         let (width, height) = match image.as_ref() {
             Some(image) => (Some(image.width), Some(image.height)),
             None => (None, None),
         };
-
-        let _: i64 = transaction.query_row(
+        let image_file_for_transaction = image_file.clone();
+        let transaction_result = (move || -> Result<Vec<String>, ClipboardError> {
+            let _: i64 = transaction.query_row(
             "INSERT INTO clipboard_items
              (hash, text, image_file, image_width, image_height, preview, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -270,53 +326,74 @@ impl ClipboardStore {
             params![
                 hash,
                 text.as_deref().unwrap_or_default(),
-                image_file,
+                image_file_for_transaction,
                 width,
                 height,
                 preview,
                 updated_at,
                 updated_at
             ],
-            |row| row.get(0),
-        )?;
+			|row| row.get::<_, i64>(0),
+			)?;
 
-        let evicted_files = {
-            let mut statement = transaction.prepare(
-                "SELECT image_file FROM clipboard_items
+            let evicted_files = {
+                let mut statement = transaction.prepare(
+                    "SELECT image_file FROM clipboard_items
                  ORDER BY updated_at DESC LIMIT -1 OFFSET ?1",
-            )?;
-            let files = statement
-                .query_map([MAX_ITEMS], |row| row.get::<_, Option<String>>(0))?
-                .filter_map(Result::transpose)
-                .collect::<Result<Vec<_>, _>>()?;
-            files
-        };
-        transaction.execute(
-            "DELETE FROM clipboard_items WHERE id IN (
+                )?;
+                let files = statement
+                    .query_map([MAX_ITEMS], |row| row.get::<_, Option<String>>(0))?
+                    .filter_map(Result::transpose)
+                    .collect::<Result<Vec<_>, _>>()?;
+                files
+            };
+            transaction.execute(
+                "DELETE FROM clipboard_items WHERE id IN (
                 SELECT id FROM clipboard_items ORDER BY updated_at DESC LIMIT -1 OFFSET ?1
             )",
-            [MAX_ITEMS],
-        )?;
-        transaction.commit()?;
-        for image_file in evicted_files {
-            remove_file_if_exists(&self.images_directory.join(image_file))?;
+                [MAX_ITEMS],
+            )?;
+            self.fail_before_commit()?;
+            transaction.commit()?;
+            Ok(evicted_files)
+        })();
+        drop(connection);
+        match transaction_result {
+            Ok(evicted_files) => {
+                for image_file in evicted_files.into_iter().take(RECONCILIATION_BATCH_SIZE) {
+                    self.remove_unreferenced_image_file_best_effort(&image_file);
+                }
+                self.reconcile_images_locked_best_effort();
+                Ok(true)
+            }
+            Err(error) => {
+                if wrote_image {
+                    self.remove_unreferenced_image_file_best_effort(
+                        image_file
+                            .as_deref()
+                            .expect("written images have a filename"),
+                    );
+                }
+                Err(error)
+            }
         }
-
-        Ok(true)
     }
 
     pub fn clear(&self) -> Result<(), ClipboardError> {
-        let connection = self
+        let _cleanup_lock = self
+            .cleanup_lock
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| ClipboardError::PoisonError)?;
-        connection.execute("DELETE FROM clipboard_items", [])?;
-        match fs::remove_dir_all(&self.images_directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        fs::create_dir_all(&self.images_directory)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM clipboard_items", [])?;
+        self.fail_before_commit()?;
+        transaction.commit()?;
+        drop(connection);
+        self.reconcile_images_locked_best_effort();
         Ok(())
     }
 
@@ -364,9 +441,190 @@ impl ClipboardStore {
         let filename = format!("{}.rgba", hash.trim_start_matches("image:"));
         let path = self.images_directory.join(&filename);
         let temporary = path.with_extension("rgba.tmp");
-        fs::write(&temporary, &image.rgba)?;
-        fs::rename(temporary, path)?;
+        if let Err(error) = fs::write(&temporary, &image.rgba) {
+            let _ = remove_file_if_exists(&temporary);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = remove_file_if_exists(&temporary);
+            return Err(error.into());
+        }
         Ok(filename)
+    }
+
+    fn reconcile_images_best_effort(&self) {
+        let _ = self.reconcile_images();
+    }
+
+    fn reconcile_images(&self) -> Result<(), ClipboardError> {
+        let _cleanup_lock = self
+            .cleanup_lock
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        self.reconcile_images_locked()
+    }
+
+    fn reconcile_images_locked_best_effort(&self) {
+        let _ = self.reconcile_images_locked();
+    }
+
+    fn reconcile_images_locked(&self) -> Result<(), ClipboardError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let references = {
+            let mut statement = transaction
+                .prepare("SELECT image_file FROM clipboard_items WHERE image_file IS NOT NULL")?;
+            let references = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|file| is_safe_image_filename(file))
+                .collect::<HashSet<_>>();
+            references
+        };
+        self.pause_reconciliation_after_reference_snapshot();
+
+        let mut traversal = self
+            .reconciliation_entries
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        if traversal.is_none() {
+            *traversal = match fs::read_dir(&self.images_directory) {
+                Ok(entries) => Some(entries),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            };
+        }
+
+        let entries = traversal
+            .as_mut()
+            .expect("reconciliation traversal is initialized");
+        let mut consumed = 0;
+        let mut removed = 0;
+        while consumed < RECONCILIATION_SCAN_LIMIT {
+            let Some(entry) = entries.next() else {
+                *traversal = None;
+                break;
+            };
+            let entry = entry?;
+            consumed += 1;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if removed < RECONCILIATION_BATCH_SIZE
+                && !references.contains(file_name)
+                && entry.file_type()?.is_file()
+            {
+                self.remove_image_file(&entry.path())?;
+                removed += 1;
+            }
+        }
+        self.record_reconciliation_entries_consumed(consumed);
+        transaction.commit()?;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn record_reconciliation_entries_consumed(&self, consumed: usize) {
+        *self.reconciliation_entries_consumed.lock().unwrap() = consumed;
+    }
+
+    #[cfg(not(test))]
+    fn record_reconciliation_entries_consumed(&self, _consumed: usize) {}
+
+    #[cfg(test)]
+    fn reconciliation_entries_consumed(&self) -> usize {
+        *self.reconciliation_entries_consumed.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    fn set_reconciliation_snapshot_pause(&self, pause: std::sync::Arc<std::sync::Barrier>) {
+        *self.reconciliation_snapshot_pause.lock().unwrap() = Some(pause);
+    }
+
+    #[cfg(test)]
+    fn clear_reconciliation_snapshot_pause(&self) {
+        *self.reconciliation_snapshot_pause.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    fn pause_reconciliation_after_reference_snapshot(&self) {
+        let pause = self.reconciliation_snapshot_pause.lock().unwrap().clone();
+        if let Some(pause) = pause {
+            pause.wait();
+            pause.wait();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn pause_reconciliation_after_reference_snapshot(&self) {}
+
+    fn remove_unreferenced_image_file_best_effort(&self, image_file: &str) {
+        let _ = self.remove_unreferenced_image_file(image_file);
+    }
+
+    fn remove_unreferenced_image_file(&self, image_file: &str) -> Result<(), ClipboardError> {
+        if !is_safe_image_filename(image_file) {
+            return Ok(());
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let referenced = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clipboard_items WHERE image_file = ?1)",
+            [image_file],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !referenced {
+            self.remove_image_file(&self.images_directory.join(image_file))?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn remove_image_file(&self, path: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .failures
+            .lock()
+            .map(|failures| failures.fail_image_removal)
+            .unwrap_or(false)
+        {
+            return Err(io::Error::other("injected image removal failure"));
+        }
+        remove_file_if_exists(path)
+    }
+
+    #[cfg(test)]
+    fn fail_next_commit(&self) {
+        self.failures.lock().unwrap().fail_next_commit = true;
+    }
+
+    #[cfg(test)]
+    fn set_image_removal_failure(&self, enabled: bool) {
+        self.failures.lock().unwrap().fail_image_removal = enabled;
+    }
+
+    fn fail_before_commit(&self) -> Result<(), ClipboardError> {
+        #[cfg(test)]
+        {
+            let mut failures = self
+                .failures
+                .lock()
+                .map_err(|_| ClipboardError::PoisonError)?;
+            if failures.fail_next_commit {
+                failures.fail_next_commit = false;
+                return Err(io::Error::other("injected database commit failure").into());
+            }
+        }
+        Ok(())
     }
 
     fn row_to_item(
@@ -414,6 +672,11 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn is_safe_image_filename(file: &str) -> bool {
+    let path = Path::new(file);
+    path.file_name().and_then(|name| name.to_str()) == Some(file)
 }
 
 fn now_ns() -> i64 {
@@ -470,9 +733,16 @@ fn migrate_sort_order(connection: &mut Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
 
-    use super::{ClipboardStore, Connection, MAX_ITEMS};
+    use super::{
+        ClipboardStore, Connection, MAX_ITEMS, RECONCILIATION_BATCH_SIZE, RECONCILIATION_SCAN_LIMIT,
+    };
     use crate::clipboard::ClipboardImage;
+    use rusqlite::params;
 
     fn image(width: u32, height: u32, byte: u8) -> ClipboardImage {
         ClipboardImage::from_rgba(vec![byte; (width * height * 4) as usize], width, height)
@@ -899,5 +1169,321 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    fn persistent_store() -> (ClipboardStore, PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("klipo-storage-failure-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("clipboard.sqlite3");
+        (ClipboardStore::open(&path).unwrap(), path, directory)
+    }
+
+    fn image_file_count(store: &ClipboardStore) -> usize {
+        fs::read_dir(&store.images_directory).unwrap().count()
+    }
+
+    #[test]
+    fn failed_insert_or_upsert_commit_leaves_no_unreferenced_image() {
+        let store = ClipboardStore::new();
+
+        store.fail_next_commit();
+        assert!(store.try_add_image(image(1, 1, 0x41), None).is_err());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&store), 0);
+
+        let original = image(1, 1, 0x42);
+        assert!(store
+            .try_add_image(original.clone(), Some("old".into()))
+            .unwrap());
+        let image_path = fs::read_dir(&store.images_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        store.fail_next_commit();
+        assert!(store
+            .try_add_image(original.clone(), Some("new".into()))
+            .is_err());
+
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(fs::read(image_path).unwrap(), original.rgba);
+        assert_eq!(image_file_count(&store), 1);
+    }
+
+    #[test]
+    fn failed_delete_commit_preserves_persisted_item_after_reopen() {
+        let (store, path, directory) = persistent_store();
+        assert!(store.try_add_image(image(1, 1, 0x43), None).unwrap());
+        let hash = store.first().unwrap().hash;
+        store.fail_next_commit();
+
+        assert!(store.delete_by_hash(&hash).is_err());
+        assert_eq!(store.list().unwrap().len(), 1);
+        drop(store);
+
+        let reopened = ClipboardStore::open(&path).unwrap();
+        assert_eq!(reopened.list().unwrap().len(), 1);
+        assert_eq!(image_file_count(&reopened), 1);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_eviction_commit_preserves_existing_rows_and_images() {
+        let store = ClipboardStore::new();
+        assert!(store.try_add_image(image(1, 1, 0x44), None).unwrap());
+        for index in 0..(MAX_ITEMS - 1) {
+            assert!(store.try_add_text(format!("item-{index}")).unwrap());
+        }
+        store.fail_next_commit();
+
+        assert!(store.try_add_text("would-evict".into()).is_err());
+        assert_eq!(store.list().unwrap().len(), MAX_ITEMS);
+        assert_eq!(image_file_count(&store), 1);
+        assert!(!store
+            .list()
+            .unwrap()
+            .iter()
+            .any(|item| item.text == "would-evict"));
+    }
+
+    #[test]
+    fn failed_clear_commit_preserves_persisted_rows_after_reopen() {
+        let (store, path, directory) = persistent_store();
+        assert!(store.try_add_text("keep".into()).unwrap());
+        assert!(store.try_add_image(image(1, 1, 0x45), None).unwrap());
+        store.fail_next_commit();
+
+        assert!(store.clear().is_err());
+        assert_eq!(store.list().unwrap().len(), 2);
+        drop(store);
+
+        let reopened = ClipboardStore::open(&path).unwrap();
+        assert_eq!(reopened.list().unwrap().len(), 2);
+        assert_eq!(image_file_count(&reopened), 1);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn delete_commits_even_when_image_cleanup_fails_then_recovers_on_reopen() {
+        let (store, path, directory) = persistent_store();
+        assert!(store.try_add_image(image(1, 1, 0x46), None).unwrap());
+        let hash = store.first().unwrap().hash;
+        store.set_image_removal_failure(true);
+
+        assert_eq!(store.delete_by_hash(&hash).unwrap(), 0);
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&store), 1);
+        drop(store);
+
+        let reopened = ClipboardStore::open(&path).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&reopened), 0);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn eviction_insert_commits_even_when_cleanup_fails_then_recovers_on_reopen() {
+        let (store, path, directory) = persistent_store();
+        assert!(store.try_add_image(image(1, 1, 0x47), None).unwrap());
+        for index in 0..(MAX_ITEMS - 1) {
+            assert!(store.try_add_text(format!("item-{index}")).unwrap());
+        }
+        store.set_image_removal_failure(true);
+
+        assert!(store.try_add_text("evict-image".into()).unwrap());
+        assert_eq!(store.list().unwrap().len(), MAX_ITEMS);
+        assert_eq!(image_file_count(&store), 1);
+        drop(store);
+
+        let reopened = ClipboardStore::open(&path).unwrap();
+        assert_eq!(reopened.list().unwrap().len(), MAX_ITEMS);
+        assert_eq!(image_file_count(&reopened), 0);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn clear_commits_even_when_image_cleanup_fails_then_recovers_on_reopen() {
+        let (store, path, directory) = persistent_store();
+        assert!(store.try_add_image(image(1, 1, 0x48), None).unwrap());
+        store.set_image_removal_failure(true);
+
+        assert!(store.clear().is_ok());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&store), 1);
+        drop(store);
+
+        let reopened = ClipboardStore::open(&path).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&reopened), 0);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_is_bounded_and_preserves_referenced_files_and_cleans_temps() {
+        let store = ClipboardStore::new();
+        assert!(store.try_add_image(image(1, 1, 0x49), None).unwrap());
+        let referenced = fs::read_dir(&store.images_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        for index in 0..RECONCILIATION_BATCH_SIZE {
+            fs::write(
+                store
+                    .images_directory
+                    .join(format!("orphan-{index:03}.rgba")),
+                [index as u8],
+            )
+            .unwrap();
+        }
+        fs::write(store.images_directory.join("interrupted.rgba.tmp"), [0]).unwrap();
+
+        store.reconcile_images().unwrap();
+        assert!(store.reconciliation_entries_consumed() <= RECONCILIATION_SCAN_LIMIT);
+        assert!(referenced.exists());
+        assert_eq!(image_file_count(&store), 2);
+
+        store.reconcile_images().unwrap();
+        assert!(store.reconciliation_entries_consumed() <= RECONCILIATION_SCAN_LIMIT);
+        assert!(referenced.exists());
+        assert_eq!(image_file_count(&store), 1);
+    }
+
+    #[test]
+    fn reconciliation_aborts_when_a_committed_image_reference_cannot_be_decoded() {
+        let store = ClipboardStore::new();
+        let protected_file = store.images_directory.join("protected.rgba");
+        fs::write(&protected_file, [0x50]).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO clipboard_items (hash, text, image_file, created_at, updated_at)
+                 VALUES ('image:blob-reference', '', ?1, 1, 1)",
+                [vec![0x01_u8]],
+            )
+            .unwrap();
+
+        assert!(store.reconcile_images().is_err());
+        assert!(protected_file.exists());
+    }
+
+    #[test]
+    fn reconciliation_eventually_reaches_orphans_after_a_stable_prefix() {
+        let store = ClipboardStore::new();
+        for index in 0..RECONCILIATION_SCAN_LIMIT {
+            let filename = format!("stable-{index:03}.rgba");
+            fs::write(store.images_directory.join(&filename), [index as u8]).unwrap();
+            store
+                .connection
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO clipboard_items (hash, text, image_file, created_at, updated_at)
+                     VALUES (?1, '', ?2, ?3, ?3)",
+                    params![format!("image:stable-{index}"), filename, index],
+                )
+                .unwrap();
+        }
+        let orphan = store.images_directory.join("later-orphan.rgba");
+        fs::write(&orphan, [0]).unwrap();
+
+        for _ in 0..2 {
+            store.reconcile_images().unwrap();
+            assert!(store.reconciliation_entries_consumed() <= RECONCILIATION_SCAN_LIMIT);
+        }
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn reconciliation_cannot_delete_an_image_committed_by_a_concurrent_insert() {
+        let store = Arc::new(ClipboardStore::new());
+        let image = image(1, 1, 0x51);
+        let filename = format!(
+            "{}.rgba",
+            ClipboardStore::hash_image(&image).trim_start_matches("image:")
+        );
+        fs::write(store.images_directory.join(filename), &image.rgba).unwrap();
+
+        let pause = Arc::new(Barrier::new(2));
+        store.set_reconciliation_snapshot_pause(pause.clone());
+        let reconciliation_store = store.clone();
+        let reconciliation = thread::spawn(move || reconciliation_store.reconcile_images());
+        pause.wait();
+
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let insert_store = store.clone();
+        let insertion = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            result_sender
+                .send(insert_store.try_add_image(image, None))
+                .unwrap();
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(result_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+
+        store.clear_reconciliation_snapshot_pause();
+        pause.wait();
+        reconciliation.join().unwrap().unwrap();
+        assert!(result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap());
+        insertion.join().unwrap();
+
+        assert!(store.first().unwrap().image.is_some());
+    }
+
+    #[test]
+    fn reconciliation_serializes_image_writes_across_store_instances() {
+        let (store, path, directory) = persistent_store();
+        let store = Arc::new(store);
+        let other_store = ClipboardStore::open(&path).unwrap();
+        let image = image(1, 1, 0x52);
+        let filename = format!(
+            "{}.rgba",
+            ClipboardStore::hash_image(&image).trim_start_matches("image:")
+        );
+        fs::write(store.images_directory.join(filename), &image.rgba).unwrap();
+
+        let pause = Arc::new(Barrier::new(2));
+        store.set_reconciliation_snapshot_pause(pause.clone());
+        let reconciliation_store = store.clone();
+        let reconciliation = thread::spawn(move || reconciliation_store.reconcile_images());
+        pause.wait();
+
+        assert!(other_store.try_add_image(image.clone(), None).is_err());
+        assert!(other_store.list().unwrap().is_empty());
+        assert_eq!(image_file_count(&other_store), 1);
+
+        store.clear_reconciliation_snapshot_pause();
+        pause.wait();
+        reconciliation.join().unwrap().unwrap();
+        assert_eq!(image_file_count(&other_store), 0);
+
+        assert!(other_store.try_add_image(image.clone(), None).unwrap());
+        let item = other_store.first().unwrap();
+        assert_eq!(item.image.unwrap().rgba, image.rgba);
+
+        drop(other_store);
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 }
