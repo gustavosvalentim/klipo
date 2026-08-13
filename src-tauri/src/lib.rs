@@ -1,5 +1,6 @@
 mod clipboard;
 mod commands;
+pub mod desktop;
 mod input;
 mod logging;
 mod settings;
