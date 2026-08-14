@@ -66,7 +66,7 @@ pub fn run() {
             let window_settings = window::Settings {
                 width: WINDOW_WIDTH,
                 height: WINDOW_HEIGHT,
-                transparent: true,
+                transparent: cfg!(target_os = "macos"),
                 decorations: false,
             };
 

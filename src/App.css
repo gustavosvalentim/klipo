@@ -118,6 +118,119 @@ button {
 		0 12px 30px rgba(0, 0, 0, 0.48);
 	display: flex;
 	flex-direction: column;
+	color: rgba(243, 244, 246, 0.8);
+}
+
+.platform-linux {
+	font-family: system-ui, "Noto Sans", "DejaVu Sans", sans-serif;
+}
+
+.platform-linux.menu {
+	border-color: #cbd5e1;
+	background: #f8fafc;
+	box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
+	color: #1e293b;
+}
+
+.platform-linux .menu__separator {
+	background: rgba(30, 41, 59, 0.18);
+}
+
+.list-item__button:hover,
+.list-item__button.is-active {
+	background: #0a84ff;
+}
+
+.platform-linux .list-item__button:hover,
+.platform-linux .list-item__button.is-active {
+	color: #ffffff;
+	background: #075985;
+}
+
+.platform-linux.settings {
+	color: #1e293b;
+	background: #f8fafc;
+}
+
+.platform-linux.settings > p {
+	color: #475569;
+}
+
+.platform-linux.settings .settings__error {
+	color: #b91c1c;
+}
+
+.platform-linux .settings__field,
+.platform-linux .settings__field:last-of-type {
+	border-color: rgba(30, 41, 59, 0.18);
+}
+
+.platform-linux .settings__shortcut {
+	border-color: #94a3b8;
+	color: #1e293b;
+	background: #ffffff;
+	box-shadow: none;
+}
+
+.platform-linux .settings__shortcut:hover {
+	background: #e2e8f0;
+}
+
+.platform-linux .settings__actions button:disabled {
+	color: #64748b;
+	background: #e2e8f0;
+}
+
+@media (prefers-color-scheme: dark) {
+	.platform-linux.menu {
+		border-color: #475569;
+		background: #1e293b;
+		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.48);
+		color: #f8fafc;
+	}
+
+	.platform-linux .menu__separator {
+		background: rgba(248, 250, 252, 0.18);
+	}
+
+	.platform-linux .list-item__button:hover,
+	.platform-linux .list-item__button.is-active {
+		color: #ffffff;
+		background: #075985;
+	}
+
+	.platform-linux.settings {
+		color: #f8fafc;
+		background: #1e293b;
+	}
+
+	.platform-linux.settings > p {
+		color: #cbd5e1;
+	}
+
+	.platform-linux.settings .settings__error {
+		color: #fca5a5;
+	}
+
+	.platform-linux .settings__field,
+	.platform-linux .settings__field:last-of-type {
+		border-color: rgba(248, 250, 252, 0.18);
+	}
+
+	.platform-linux .settings__shortcut {
+		border-color: #64748b;
+		color: #f8fafc;
+		background: #334155;
+	}
+
+	.platform-linux .settings__shortcut:hover {
+		background: #475569;
+	}
+
+	.platform-linux .settings__actions button:disabled {
+		color: #94a3b8;
+		background: #334155;
+	}
 }
 
 .menu__text {

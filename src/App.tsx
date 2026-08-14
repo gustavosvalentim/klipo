@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ClearHistoryButton } from "./components/ClearHistoryButton";
 import { ListItem } from "./components/ListItem";
 import { logError } from "./log";
+import { getPlatformPresentation, shortcutLabel } from "./platform";
 import "./App.css";
 
 type ClipboardItem = {
@@ -47,32 +48,15 @@ function shortcutFromEvent(event: KeyboardEvent) {
 	return [...modifiers, event.code].join("+");
 }
 
-function shortcutLabel(shortcut: string) {
-	return shortcut
-		.replace(/SUPER/g, "⌘")
-		.replace(/CTRL/g, "⌃")
-		.replace(/ALT/g, "⌥")
-		.replace(/SHIFT/g, "⇧")
-		.replace(/ArrowUp/g, "↑")
-		.replace(/ArrowDown/g, "↓")
-		.replace(/ArrowLeft/g, "←")
-		.replace(/ArrowRight/g, "→")
-		.replace(/Enter/g, "↩")
-		.replace(/Backspace/g, "⌫")
-		.replace(/Delete/g, "⌦")
-		.replace(/Key([A-Z])/g, "$1")
-		.replace(/Digit([0-9])/g, "$1")
-		.replace(/\+/g, "");
-}
-
 const MenuSeparator = () => (
-	<div className="h-px my-[4px] mx-0 bg-[rgba(235,235,245,0.18)]" />
+	<div className="menu__separator h-px my-[4px] mx-0 bg-[rgba(235,235,245,0.18)]" />
 );
 
 function App() {
 	const [clipboard, setClipboard] = useState<Clipboard>([]);
 	const [selectedItem, setSelectedItem] = useState<number | null>(null);
 	const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
+	const platformPresentation = getPlatformPresentation();
 
 	const historyRef = useRef<HTMLDivElement>(null);
 
@@ -230,7 +214,7 @@ function App() {
 	}, [handleKeyDown, handleBlur, handleFocus]);
 
 	return (
-		<div className="menu text-gray-100/80">
+		<div className={`menu ${platformPresentation.className}`}>
 			<div className="menu__content">
 				<div className="flex justify-between items-center mx-2">
 					<div className="flex justify-left items-center">
@@ -259,6 +243,7 @@ function SettingsView() {
 	const [draft, setDraft] = useState<ShortcutSettings | null>(null);
 	const [recording, setRecording] = useState<ShortcutField | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const platformPresentation = getPlatformPresentation();
 
 	const load = useCallback(
 		() =>
@@ -308,11 +293,18 @@ function SettingsView() {
 	if (!draft || !saved) {
 		if (error)
 			return (
-				<main className="settings settings__error" role="alert">
+				<main
+					className={`settings settings__error ${platformPresentation.className}`}
+					role="alert"
+				>
 					{error}
 				</main>
 			);
-		return <main className="settings">Loading settings…</main>;
+		return (
+			<main className={`settings ${platformPresentation.className}`}>
+				Loading settings…
+			</main>
+		);
 	}
 
 	const save = async () => {
@@ -330,7 +322,7 @@ function SettingsView() {
 	};
 
 	return (
-		<main className="settings">
+		<main className={`settings ${platformPresentation.className}`}>
 			<h1>Keyboard shortcuts</h1>
 			<p>
 				Click a shortcut, then press one key combination. Escape always closes
