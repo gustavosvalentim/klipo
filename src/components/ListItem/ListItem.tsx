@@ -12,9 +12,9 @@ type ListItemButtonProps = React.PropsWithChildren & {
 };
 
 const ListItemButtonStyle =
-	"flex-1 min-w-0 h-[24px] border-0 rounded-sm text-left overflow-hidden";
+	"list-item__button flex-1 min-w-0 h-[24px] border-0 rounded-sm text-left overflow-hidden";
 
-const ActiveListItemButtonStyle = "bg-[#0a84ff]";
+const ActiveListItemButtonStyle = "is-active";
 
 const ListItemButton = ({
 	onClick,
@@ -45,7 +45,7 @@ export const ListItem = ({
 	<div className="flex w-full items-center my-1">
 		<ListItemButton
 			onClick={onClick}
-			className="hover:bg-[#0a84ff] px-2"
+			className="px-2"
 			active={active}
 			{...props}
 		>

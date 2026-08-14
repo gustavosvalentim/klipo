@@ -1,7 +1,6 @@
-use tauri::{
-    window::{Effect, EffectState, EffectsBuilder},
-    Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent,
-};
+#[cfg(target_os = "macos")]
+use tauri::window::{Effect, EffectState, EffectsBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Window, WindowEvent};
 
 use crate::state::AppState;
 
@@ -32,14 +31,17 @@ pub fn create_klipo_window(
     app: &tauri::AppHandle,
     settings: Settings,
 ) -> Result<WebviewWindow, WindowError> {
-    let window = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::default())
+    let window_builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::default())
         .inner_size(settings.width, settings.height)
         .decorations(settings.decorations)
         .transparent(settings.transparent)
         .always_on_top(true)
         .visible(false)
         .visible_on_all_workspaces(true)
-        .shadow(false)
+        .shadow(false);
+
+    #[cfg(target_os = "macos")]
+    let window_builder = window_builder
         // `Menu` matches a macOS popup menu more closely than `Popover`.
         // Its radius clips the native backdrop too, rather than leaving a
         // square vibrancy layer behind the rounded web content.
@@ -49,8 +51,9 @@ pub fn create_klipo_window(
                 .state(EffectState::Active)
                 .radius(11.0)
                 .build(),
-        )
-        .build();
+        );
+
+    let window = window_builder.build();
 
     let window = match window {
         Ok(window) => window,
