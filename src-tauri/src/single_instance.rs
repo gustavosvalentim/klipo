@@ -99,6 +99,7 @@ pub fn run_primary_setup<T, E, D>(
     feature = "single-instance-test"
 ))]
 pub mod test_support {
+    use log::error;
     use std::{
         fs::OpenOptions,
         io::Write,
