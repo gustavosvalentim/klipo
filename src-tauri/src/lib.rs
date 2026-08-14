@@ -71,14 +71,14 @@ pub fn run() {
 
             #[cfg(target_os = "linux")]
             {
-                return single_instance::run_primary_setup(
+                single_instance::run_primary_setup(
                     &picker_activation,
                     || initialize_application(app),
                     || window::show_picker_window(&app_handle),
                     |error_value| {
                         error!(error:debug = error_value; "Failed to activate queued picker window");
                     },
-                );
+                )
             }
 
             #[cfg(not(target_os = "linux"))]
