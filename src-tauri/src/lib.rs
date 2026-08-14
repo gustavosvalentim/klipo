@@ -50,6 +50,9 @@ pub fn run() {
             save_shortcuts,
         ])
         .setup(move |app| {
+            #[cfg(target_os = "linux")]
+            let app_handle = app.handle().clone();
+
             #[cfg(all(
                 target_os = "linux",
                 debug_assertions,
@@ -59,7 +62,7 @@ pub fn run() {
                 return single_instance::run_primary_setup(
                     &picker_activation,
                     || single_instance::test_support::initialize_primary_resources(app),
-                    || window::show_picker_window(&app.handle()),
+                    || window::show_picker_window(&app_handle),
                     |error_value| {
                         error!(error:debug = error_value; "Failed to activate queued picker window");
                     },
@@ -71,7 +74,7 @@ pub fn run() {
                 return single_instance::run_primary_setup(
                     &picker_activation,
                     || initialize_application(app),
-                    || window::show_picker_window(&app.handle()),
+                    || window::show_picker_window(&app_handle),
                     |error_value| {
                         error!(error:debug = error_value; "Failed to activate queued picker window");
                     },
