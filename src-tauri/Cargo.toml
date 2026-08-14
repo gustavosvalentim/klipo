@@ -14,6 +14,9 @@ edition = "2021"
 name = "klipo_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+single-instance-test = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -31,6 +34,9 @@ tokio = { version = "1", features = ["time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 log = { version = "0.4", features = ["kv_serde"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
@@ -41,6 +47,9 @@ strip = true
 
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2-app-kit = { version = "0.3.2", features = ["NSColor", "NSWindow", "NSWorkspace", "NSRunningApplication", "objc2-core-foundation"] }
+
+[target."cfg(target_os = \"linux\")".dependencies]
+tauri-plugin-single-instance = "2.4.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"

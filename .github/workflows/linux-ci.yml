@@ -22,13 +22,16 @@ jobs:
           sudo apt-get install --yes \
             build-essential \
             curl \
+            dbus-x11 \
             file \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
-            wget
+            openbox \
+            wget \
+            xvfb
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -57,7 +60,14 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: |
+          dbus-run-session -- xvfb-run --auto-servernum sh -c '
+            openbox >/tmp/klipo-openbox.log 2>&1 &
+            window_manager_pid=$!
+            trap "kill $window_manager_pid 2>/dev/null || true" EXIT
+            sleep 0.2
+            cargo test --manifest-path src-tauri/Cargo.toml --features single-instance-test
+          '
 
       - name: Verify x86_64 build host
         shell: bash

@@ -14,6 +14,9 @@ pub struct Settings {
     pub decorations: bool,
 }
 
+const PICKER_WIDTH: f64 = 250.0;
+const PICKER_HEIGHT: f64 = 350.0;
+
 #[derive(Debug)]
 pub enum WindowError {
     TauriError(tauri::Error),
@@ -63,8 +66,28 @@ pub fn create_klipo_window(
     Ok(window)
 }
 
+pub fn create_picker_window(app: &tauri::AppHandle) -> Result<WebviewWindow, WindowError> {
+    create_klipo_window(
+        app,
+        Settings {
+            width: PICKER_WIDTH,
+            height: PICKER_HEIGHT,
+            transparent: cfg!(target_os = "macos"),
+            decorations: false,
+        },
+    )
+}
+
 pub fn get_main_window(app: &tauri::AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(MAIN_WINDOW_LABEL)
+}
+
+#[cfg(target_os = "linux")]
+pub fn show_picker_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+    let window = get_main_window(app).ok_or(tauri::Error::WindowNotFound)?;
+
+    window.show()?;
+    window.set_focus()
 }
 
 pub fn show_settings_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
