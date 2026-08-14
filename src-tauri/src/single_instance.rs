@@ -59,10 +59,10 @@ impl PickerActivation {
 }
 
 #[cfg(target_os = "linux")]
-pub fn register<R: tauri::Runtime>(
-    builder: tauri::Builder<R>,
+pub fn register(
+    builder: tauri::Builder<tauri::Wry>,
     picker_activation: Arc<PickerActivation>,
-) -> tauri::Builder<R> {
+) -> tauri::Builder<tauri::Wry> {
     builder.plugin(tauri_plugin_single_instance::init(move |app, _, _| {
         #[cfg(all(debug_assertions, feature = "single-instance-test"))]
         let delivery =
