@@ -111,4 +111,18 @@ mod tests {
         assert_eq!(load(&path), settings);
         let _ = fs::remove_dir_all(directory);
     }
+
+    #[test]
+    fn persists_a_changed_global_shortcut_for_the_next_launch() {
+        let directory =
+            std::env::temp_dir().join(format!("klipo-shortcut-restart-{}", std::process::id()));
+        let path = directory.join("shortcuts.json");
+        let mut settings = ShortcutSettings::default();
+        settings.open_klipo = "SUPER+ALT+KeyK".into();
+
+        save(&path, &settings).unwrap();
+
+        assert_eq!(load(&path).open_klipo, "SUPER+ALT+KeyK");
+        let _ = fs::remove_dir_all(directory);
+    }
 }

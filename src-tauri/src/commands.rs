@@ -51,17 +51,41 @@ pub fn save_shortcuts(
 
     let previous = active_shortcuts.clone();
 
-    shortcuts::replace_global_shortcuts(&app, &previous, &settings)?;
-
-    let path = shortcuts::settings_path(&app).map_err(|error| error.to_string())?;
-    if let Err(error) = crate::settings::save(&path, &settings) {
-        let _ = shortcuts::replace_global_shortcuts(&app, &settings, &previous);
-        return Err(format!("Could not save shortcut settings: {error}"));
-    }
+    save_shortcut_transaction(
+        &previous,
+        &settings,
+        || shortcuts::settings_path(&app).map_err(|error| error.to_string()),
+        |active, requested| shortcuts::replace_global_shortcuts(&app, active, requested),
+        |path, requested| crate::settings::save(path, requested),
+    )?;
 
     *active_shortcuts = settings.clone();
 
     Ok(settings)
+}
+
+fn save_shortcut_transaction<Destination>(
+    previous: &ShortcutSettings,
+    next: &ShortcutSettings,
+    prepare_persistence: impl FnOnce() -> Result<Destination, String>,
+    mut replace: impl FnMut(&ShortcutSettings, &ShortcutSettings) -> Result<(), String>,
+    persist: impl FnOnce(&Destination, &ShortcutSettings) -> Result<(), String>,
+) -> Result<(), String> {
+    let destination = prepare_persistence()?;
+
+    replace(previous, next)?;
+
+    match persist(&destination, next) {
+        Ok(()) => Ok(()),
+        Err(error_value) => match replace(next, previous) {
+            Ok(()) => Err(format!(
+                "Could not save shortcut settings: {error_value}; restored the previous global shortcut binding"
+            )),
+            Err(rollback_error) => Err(format!(
+                "Could not save shortcut settings: {error_value}; failed to restore the previous global shortcut binding ({rollback_error})"
+            )),
+        },
+    }
 }
 
 #[tauri::command]
@@ -183,12 +207,99 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_emit_clear_event;
+    use super::{save_shortcut_transaction, should_emit_clear_event};
+    use crate::settings::ShortcutSettings;
     use crate::storage::ClipboardError;
 
     #[test]
     fn clear_event_is_emitted_only_after_a_committed_clear() {
         assert!(should_emit_clear_event(&Ok(())));
         assert!(!should_emit_clear_event(&Err(ClipboardError::ItemNotFound)));
+    }
+
+    #[test]
+    fn persistence_failure_restores_the_previous_runtime_binding() {
+        let previous = ShortcutSettings::default();
+        let mut next = ShortcutSettings::default();
+        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let mut replacements = Vec::new();
+
+        let error_value = save_shortcut_transaction(
+            &previous,
+            &next,
+            || Ok(()),
+            |active, requested| {
+                replacements.push((active.open_klipo.clone(), requested.open_klipo.clone()));
+                Ok(())
+            },
+            |_, _| Err("disk is unavailable".into()),
+        )
+        .expect_err("persistence failure rolls the binding back");
+
+        assert!(error_value.contains("restored the previous"));
+        assert_eq!(
+            replacements,
+            vec![
+                ("SUPER+SHIFT+KeyV".into(), "SUPER+ALT+KeyK".into()),
+                ("SUPER+ALT+KeyK".into(), "SUPER+SHIFT+KeyV".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_persistence_preparation_leaves_the_runtime_binding_unchanged() {
+        let previous = ShortcutSettings::default();
+        let mut next = ShortcutSettings::default();
+        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let mut replacement_attempted = false;
+
+        let error_value = save_shortcut_transaction(
+            &previous,
+            &next,
+            || Err("settings directory is unavailable".into()),
+            |_, _| {
+                replacement_attempted = true;
+                Ok(())
+            },
+            |_: &(), _| Ok(()),
+        )
+        .expect_err("preparation failure prevents runtime replacement");
+
+        assert_eq!(error_value, "settings directory is unavailable");
+        assert!(!replacement_attempted);
+    }
+
+    #[test]
+    fn persistence_failure_reports_when_the_inverse_runtime_replacement_also_fails() {
+        let previous = ShortcutSettings::default();
+        let mut next = ShortcutSettings::default();
+        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let mut replacements = Vec::new();
+
+        let error_value = save_shortcut_transaction(
+            &previous,
+            &next,
+            || Ok(()),
+            |active, requested| {
+                replacements.push((active.open_klipo.clone(), requested.open_klipo.clone()));
+                if replacements.len() == 2 {
+                    Err("X11 backend refused rollback".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| Err("disk is unavailable".into()),
+        )
+        .expect_err("a failed inverse replacement is returned to the caller");
+
+        assert!(error_value.contains("disk is unavailable"));
+        assert!(error_value.contains("X11 backend refused rollback"));
+        assert_eq!(
+            replacements,
+            vec![
+                ("SUPER+SHIFT+KeyV".into(), "SUPER+ALT+KeyK".into()),
+                ("SUPER+ALT+KeyK".into(), "SUPER+SHIFT+KeyV".into()),
+            ]
+        );
     }
 }
