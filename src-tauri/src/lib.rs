@@ -18,7 +18,7 @@ use commands::{
     save_shortcuts,
 };
 use log::{error, info};
-use shortcuts::{load_and_register_shortcuts, register_shortcuts_plugin};
+use shortcuts::{cleanup_global_shortcuts, initialize_global_shortcuts};
 #[cfg(target_os = "linux")]
 use single_instance::PickerActivation;
 use state::AppState;
@@ -35,7 +35,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let builder = single_instance::register(builder, std::sync::Arc::clone(&picker_activation));
 
-    builder
+    let application = builder
         .on_window_event(window_events_handler)
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -84,11 +84,19 @@ pub fn run() {
             #[cfg(not(target_os = "linux"))]
             initialize_application(app)
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .unwrap_or_else(|error_value| {
-            error!(error:debug = error_value; "Tauri application stopped with an error");
+            error!(error:debug = error_value; "Tauri application could not start");
             std::process::exit(1);
         });
+
+    application.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            if let Err(error_value) = cleanup_global_shortcuts(app_handle) {
+                error!(error:% = error_value; "Failed to release global shortcut resources during shutdown");
+            }
+        }
+    });
 }
 
 fn initialize_application(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -114,8 +122,7 @@ fn initialize_application(app: &mut tauri::App) -> Result<(), Box<dyn std::error
 
     let app_handle = app.handle().clone();
 
-    register_shortcuts_plugin(&app_handle)?;
-    load_and_register_shortcuts(&app_handle)?;
+    initialize_global_shortcuts(&app_handle)?;
     tray::create(&app_handle)?;
     create_picker_window(&app_handle).map_err(|_| tauri::Error::WindowNotFound)?;
 
