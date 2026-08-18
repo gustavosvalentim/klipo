@@ -1,6 +1,7 @@
 use std::vec::Vec;
 
 use log::{debug, error};
+use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem, SystemClipboard};
@@ -126,50 +127,115 @@ pub(crate) fn write_to_clipboard(
     system_clipboard.write_item(item)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PasteOutcome {
+    Pasted,
+    CopiedForManualPaste,
+    ClipboardWriteFailed,
+}
+
+trait PasteOperations {
+    fn item_for_hash(&self, hash: &str) -> Option<ClipboardItem>;
+    fn write_item(&self, item: &ClipboardItem) -> Result<(), String>;
+    fn move_to_top(&self, hash: &str) -> Result<(), String>;
+    fn restore_target(&self) -> Result<(), String>;
+    fn hide_picker(&self) -> Result<(), String>;
+    fn simulate_input(&self) -> Result<(), String>;
+}
+
+struct AppPasteOperations<'a> {
+    app: &'a AppHandle,
+    state: &'a AppState,
+}
+
+impl PasteOperations for AppPasteOperations<'_> {
+    fn item_for_hash(&self, hash: &str) -> Option<ClipboardItem> {
+        self.state.clipboard.get_by_hash(hash)
+    }
+
+    fn write_item(&self, item: &ClipboardItem) -> Result<(), String> {
+        let system_clipboard = self
+            .state
+            .system_clipboard
+            .as_ref()
+            .ok_or_else(|| "Clipboard write is unavailable".to_owned())?;
+
+        write_to_clipboard(system_clipboard, item).map_err(|error| error.to_string())
+    }
+
+    fn move_to_top(&self, hash: &str) -> Result<(), String> {
+        self.state
+            .clipboard
+            .move_to_top_by_hash(hash)
+            .map_err(|error| error.to_string())
+    }
+
+    fn restore_target(&self) -> Result<(), String> {
+        restore_focused_window(self.state).map_err(|error| error.to_string())
+    }
+
+    fn hide_picker(&self) -> Result<(), String> {
+        let window = get_main_window(self.app)
+            .ok_or_else(|| String::from("Main picker window unavailable"))?;
+        window.hide().map_err(|error| error.to_string())
+    }
+
+    fn simulate_input(&self) -> Result<(), String> {
+        let mut guard = self
+            .state
+            .input
+            .enigo
+            .lock()
+            .map_err(|_| "Input state is unavailable".to_string())?;
+        let enigo = guard
+            .as_mut()
+            .ok_or_else(|| "Input simulation is unavailable".to_string())?;
+
+        simulate_paste_input(enigo).map_err(|error| error.to_string())
+    }
+}
+
+fn paste_with(operations: &impl PasteOperations, hash: &str) -> PasteOutcome {
+    let Some(item) = operations.item_for_hash(hash) else {
+        return PasteOutcome::ClipboardWriteFailed;
+    };
+
+    if let Err(error_value) = operations.write_item(&item) {
+        error!(error:% = error_value; "Failed to write item to clipboard");
+        return PasteOutcome::ClipboardWriteFailed;
+    }
+
+    if let Err(error_value) = operations.move_to_top(hash) {
+        error!(error:% = error_value; "Failed to move copied item to the top");
+        return PasteOutcome::CopiedForManualPaste;
+    }
+
+    if let Err(error_value) = operations.restore_target() {
+        error!(error:% = error_value; "Failed to restore paste target");
+        return PasteOutcome::CopiedForManualPaste;
+    }
+
+    if let Err(error_value) = operations.hide_picker() {
+        error!(error:% = error_value; "Failed to hide picker before automatic paste");
+        return PasteOutcome::CopiedForManualPaste;
+    }
+
+    if let Err(error_value) = operations.simulate_input() {
+        error!(error:% = error_value; "Failed to simulate paste input");
+        return PasteOutcome::CopiedForManualPaste;
+    }
+
+    PasteOutcome::Pasted
+}
+
 #[tauri::command]
-pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
-    let Some(item) = state.clipboard.get_by_hash(hash) else {
-        return;
+pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) -> PasteOutcome {
+    let operations = AppPasteOperations {
+        app: &app,
+        state: &state,
     };
 
-    let Some(system_clipboard) = state.system_clipboard.as_ref() else {
-        error!(capability = "clipboard_write", failure_category = "adapter_unavailable"; "Clipboard write is unavailable");
-        return;
-    };
-
-    if let Err(error_value) = write_to_clipboard(system_clipboard, &item) {
-        error!(error:debug = error_value; "Failed to write item to clipboard");
-        return;
-    }
-
-    if let Err(error_value) = state.clipboard.move_to_top_by_hash(hash) {
-        error!(error:debug = error_value; "Failed to move pasted item to the top");
-    }
-
-    if let Some(window) = get_main_window(&app) {
-        if let Err(error_value) = window.hide() {
-            error!(error:debug = error_value; "Failed to hide window");
-        }
-    }
-
-    if let Err(error_value) = restore_focused_window(&state) {
-        error!(error:debug = error_value; "Failed to restore focus");
-        return;
-    }
-
-    let Ok(mut guard) = state.input.enigo.lock() else {
-        error!("Failed to lock input state");
-        return;
-    };
-
-    let Some(enigo) = guard.as_mut() else {
-        error!("Failed to get enigo");
-        return;
-    };
-
-    if let Err(error_value) = simulate_paste_input(enigo) {
-        error!(error:debug = error_value; "Failed to simulate paste input");
-    }
+    paste_with(&operations, hash)
 }
 
 #[tauri::command]
@@ -231,9 +297,95 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{save_shortcut_transaction, should_emit_clear_event};
+    use super::{
+        paste_with, save_shortcut_transaction, should_emit_clear_event, PasteOperations,
+        PasteOutcome,
+    };
+    use crate::clipboard::ClipboardItem;
     use crate::settings::ShortcutSettings;
     use crate::storage::ClipboardError;
+
+    struct FakePasteOperations {
+        item: Option<ClipboardItem>,
+        write_result: Result<(), String>,
+        reorder_result: Result<(), String>,
+        restore_result: Result<(), String>,
+        hide_result: Result<(), String>,
+        input_result: Result<(), String>,
+        events: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl FakePasteOperations {
+        fn successful() -> Self {
+            Self {
+                item: Some(ClipboardItem {
+                    text: "copied text".into(),
+                    hash: "text:known".into(),
+                    image: None,
+                    preview: None,
+                }),
+                write_result: Ok(()),
+                reorder_result: Ok(()),
+                restore_result: Ok(()),
+                hide_result: Ok(()),
+                input_result: Ok(()),
+                events: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failed(message: &str) -> Result<(), String> {
+            Err(message.into())
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl PasteOperations for FakePasteOperations {
+        fn item_for_hash(&self, _hash: &str) -> Option<ClipboardItem> {
+            self.item.clone()
+        }
+
+        fn write_item(&self, _item: &ClipboardItem) -> Result<(), String> {
+            self.events.borrow_mut().push("write");
+            self.write_result.clone()
+        }
+
+        fn move_to_top(&self, _hash: &str) -> Result<(), String> {
+            self.events.borrow_mut().push("reorder");
+            self.reorder_result.clone()
+        }
+
+        fn restore_target(&self) -> Result<(), String> {
+            self.events.borrow_mut().push("restore");
+            self.restore_result.clone()
+        }
+
+        fn hide_picker(&self) -> Result<(), String> {
+            self.events.borrow_mut().push("hide");
+            self.hide_result.clone()
+        }
+
+        fn simulate_input(&self) -> Result<(), String> {
+            self.events.borrow_mut().push("input");
+            self.input_result.clone()
+        }
+    }
+
+    fn assert_manual_paste_after_input_failure(error: &str) {
+        let mut operations = FakePasteOperations::successful();
+        operations.input_result = FakePasteOperations::failed(error);
+
+        assert_eq!(
+            paste_with(&operations, "text:known"),
+            PasteOutcome::CopiedForManualPaste
+        );
+        assert_eq!(
+            operations.events(),
+            ["write", "reorder", "restore", "hide", "input"]
+        );
+    }
 
     #[test]
     fn clear_event_is_emitted_only_after_a_committed_clear() {
@@ -353,5 +505,117 @@ mod tests {
                 ("SUPER+ALT+KeyK".into(), "SUPER+SHIFT+KeyV".into()),
             ]
         );
+    }
+
+    #[test]
+    fn paste_outcomes_serialize_as_the_frontend_contract() {
+        assert_eq!(
+            serde_json::to_value(PasteOutcome::Pasted).unwrap(),
+            serde_json::json!("Pasted")
+        );
+        assert_eq!(
+            serde_json::to_value(PasteOutcome::CopiedForManualPaste).unwrap(),
+            serde_json::json!("CopiedForManualPaste")
+        );
+        assert_eq!(
+            serde_json::to_value(PasteOutcome::ClipboardWriteFailed).unwrap(),
+            serde_json::json!("ClipboardWriteFailed")
+        );
+    }
+
+    #[test]
+    fn unknown_hash_does_not_change_history_or_picker() {
+        let mut operations = FakePasteOperations::successful();
+        operations.item = None;
+
+        assert_eq!(
+            paste_with(&operations, "text:unknown"),
+            PasteOutcome::ClipboardWriteFailed
+        );
+        assert!(operations.events().is_empty());
+    }
+
+    #[test]
+    fn clipboard_write_failure_does_not_change_history_or_picker() {
+        let mut operations = FakePasteOperations::successful();
+        operations.write_result = FakePasteOperations::failed("write");
+
+        assert_eq!(
+            paste_with(&operations, "text:known"),
+            PasteOutcome::ClipboardWriteFailed
+        );
+        assert_eq!(operations.events(), ["write"]);
+    }
+
+    #[test]
+    fn successful_paste_writes_reorders_restores_hides_then_inputs() {
+        let operations = FakePasteOperations::successful();
+
+        assert_eq!(paste_with(&operations, "text:known"), PasteOutcome::Pasted);
+        assert_eq!(
+            operations.events(),
+            ["write", "reorder", "restore", "hide", "input"]
+        );
+    }
+
+    #[test]
+    fn reorder_failure_keeps_picker_open_for_manual_paste() {
+        let mut operations = FakePasteOperations::successful();
+        operations.reorder_result = FakePasteOperations::failed("reorder");
+
+        assert_eq!(
+            paste_with(&operations, "text:known"),
+            PasteOutcome::CopiedForManualPaste
+        );
+        assert_eq!(operations.events(), ["write", "reorder"]);
+    }
+
+    #[test]
+    fn unavailable_target_keeps_picker_open_for_manual_paste() {
+        let mut operations = FakePasteOperations::successful();
+        operations.restore_result = FakePasteOperations::failed("target unavailable");
+
+        assert_eq!(
+            paste_with(&operations, "text:known"),
+            PasteOutcome::CopiedForManualPaste
+        );
+        assert_eq!(operations.events(), ["write", "reorder", "restore"]);
+    }
+
+    #[test]
+    fn hide_failure_does_not_attempt_input_or_report_success() {
+        let mut operations = FakePasteOperations::successful();
+        operations.hide_result = FakePasteOperations::failed("hide");
+
+        assert_eq!(
+            paste_with(&operations, "text:known"),
+            PasteOutcome::CopiedForManualPaste
+        );
+        assert_eq!(operations.events(), ["write", "reorder", "restore", "hide"]);
+    }
+
+    #[test]
+    fn unavailable_input_keeps_picker_open_for_manual_paste() {
+        assert_manual_paste_after_input_failure("input unavailable");
+    }
+
+    #[test]
+    fn modifier_press_failure_is_not_a_successful_paste() {
+        assert_manual_paste_after_input_failure("modifier press");
+    }
+
+    #[test]
+    fn v_click_failure_is_not_a_successful_paste() {
+        assert_manual_paste_after_input_failure("v click");
+    }
+
+    #[test]
+    fn modifier_release_failure_is_not_a_successful_paste() {
+        assert_manual_paste_after_input_failure("modifier release");
+    }
+
+    #[test]
+    fn click_and_release_failure_is_not_a_successful_paste() {
+        assert_manual_paste_after_input_failure("v click and modifier release");
     }
 }
