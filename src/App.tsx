@@ -20,6 +20,8 @@ type ClipboardItem = {
 
 type Clipboard = ClipboardItem[];
 
+type PasteOutcome = "Pasted" | "CopiedForManualPaste" | "ClipboardWriteFailed";
+
 type ShortcutSettings = {
 	version: number;
 	openKlipo: string;
@@ -56,22 +58,30 @@ const MenuSeparator = () => (
 	<div className="menu__separator h-px my-[4px] mx-0 bg-[rgba(235,235,245,0.18)]" />
 );
 
-function App() {
+export function App() {
 	const [clipboard, setClipboard] = useState<Clipboard>([]);
 	const [selectedItem, setSelectedItem] = useState<number | null>(null);
 	const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
 	const [capabilities, setCapabilities] = useState<DesktopCapabilities | null>(
 		null,
 	);
+	const [manualPasteCopied, setManualPasteCopied] = useState(false);
 	const platformPresentation = getPlatformPresentation();
 
 	const historyRef = useRef<HTMLDivElement>(null);
+	const pasteRequest = useRef(0);
+
+	const invalidatePasteRequest = useCallback(() => {
+		pasteRequest.current += 1;
+		setManualPasteCopied(false);
+	}, []);
 
 	const hide = useCallback(() => {
+		invalidatePasteRequest();
 		void invoke("close").catch((error) =>
 			logError("Failed to close picker", error),
 		);
-	}, []);
+	}, [invalidatePasteRequest]);
 
 	const fetchClipboardHistory = useCallback(async () => {
 		try {
@@ -98,29 +108,74 @@ function App() {
 	);
 
 	const clearHistory = useCallback(async () => {
+		invalidatePasteRequest();
+
 		try {
 			await invoke("clear");
 		} catch (error) {
 			logError("Failed to clear clipboard history", error);
 		}
-	}, []);
+	}, [invalidatePasteRequest]);
 
-	const pasteFromSelection = useCallback(async (hash: string) => {
-		try {
-			await invoke("paste", { hash });
-		} catch (error) {
-			logError("Failed to paste from selection", error);
-		}
-	}, []);
+	const pasteFromSelection = useCallback(
+		async (hash: string) => {
+			invalidatePasteRequest();
+			const request = pasteRequest.current;
 
-	const deleteItem = useCallback(async (hash: string) => {
-		try {
-			await invoke("delete_item", { hash });
-			setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
-		} catch (error) {
-			logError("Failed to delete clipboard item", error);
-		}
-	}, []);
+			try {
+				const outcome = await invoke<PasteOutcome>("paste", { hash });
+
+				if (
+					request === pasteRequest.current &&
+					outcome === "CopiedForManualPaste"
+				) {
+					const picker = getCurrentWindow();
+					const showedPicker = await picker
+						.show()
+						.then(() => true)
+						.catch((error) => {
+							logError("Failed to show picker for manual paste", error);
+							return false;
+						});
+					const focusedPicker =
+						request === pasteRequest.current
+							? await picker
+									.setFocus()
+									.then(() => true)
+									.catch((error) => {
+										logError("Failed to focus picker for manual paste", error);
+										return false;
+									})
+							: false;
+
+					if (
+						request === pasteRequest.current &&
+						showedPicker &&
+						focusedPicker
+					) {
+						setManualPasteCopied(true);
+					}
+				}
+			} catch (error) {
+				logError("Failed to paste from selection", error);
+			}
+		},
+		[invalidatePasteRequest],
+	);
+
+	const deleteItem = useCallback(
+		async (hash: string) => {
+			invalidatePasteRequest();
+
+			try {
+				await invoke("delete_item", { hash });
+				setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
+			} catch (error) {
+				logError("Failed to delete clipboard item", error);
+			}
+		},
+		[invalidatePasteRequest],
+	);
 
 	const clipboardMenuItems = useMemo(
 		() =>
@@ -135,6 +190,8 @@ function App() {
 
 	const handleKeyDown = useCallback(
 		(event: KeyboardEvent) => {
+			invalidatePasteRequest();
+
 			if (event.key === "Escape") {
 				event.preventDefault();
 				hide();
@@ -195,7 +252,15 @@ function App() {
 
 			setSelectedItem(newSelectedItem);
 		},
-		[clipboard, selectedItem, pasteFromSelection, hide, deleteItem, shortcuts],
+		[
+			clipboard,
+			selectedItem,
+			pasteFromSelection,
+			hide,
+			deleteItem,
+			shortcuts,
+			invalidatePasteRequest,
+		],
 	);
 
 	const handleBlur = useCallback(() => {
@@ -251,6 +316,11 @@ function App() {
 						<ClearHistoryButton onClick={clearHistory} />
 					</div>
 				</div>
+				{manualPasteCopied && (
+					<p role="status" aria-live="polite" className="mx-2 text-sm">
+						Copied
+					</p>
+				)}
 
 				<MenuSeparator />
 

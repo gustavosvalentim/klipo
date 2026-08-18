@@ -33,7 +33,9 @@ Klipo currently supports macOS only. Linux and Windows support are not implement
 7. Enable Klipo under **System Settings > Privacy & Security > Accessibility**.
 8. Restart Klipo.
 
-Accessibility permission is required to paste into the previously active application.
+Accessibility permission is required to paste into the previously active application. If Klipo
+cannot activate that application or simulate the paste shortcut, it keeps the picker available and
+reports that the item was copied so you can paste it manually.
 
 ## Usage
 
