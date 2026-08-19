@@ -50,8 +50,8 @@ impl ManagedChild {
         let child = Command::new(env!("CARGO_BIN_EXE_klipo"))
             .env(TRACE_PATH_ENV, trace_path)
             .env(SHUTDOWN_SIGNAL_ENV, shutdown_signal)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("launch Klipo");
 
@@ -62,15 +62,20 @@ impl ManagedChild {
     }
 
     fn wait_success(&mut self) {
-        let status = self
+        let output = self
             .child
-            .as_mut()
+            .take()
             .expect("child remains managed until it exits")
-            .wait()
+            .wait_with_output()
             .expect("managed child exits");
 
-        assert!(status.success(), "managed child exits successfully");
-        self.child = None;
+        assert!(
+            output.status.success(),
+            "managed child exits successfully; status={}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
 
