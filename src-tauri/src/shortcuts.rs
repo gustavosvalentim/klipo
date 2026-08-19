@@ -234,11 +234,25 @@ pub fn cleanup_global_shortcuts(app: &tauri::AppHandle) -> Result<(), String> {
     if global_shortcuts_supported() {
         #[cfg(desktop)]
         {
-            let mut registry = TauriShortcutRegistry {
-                shortcuts: app.global_shortcut(),
-            };
-            cleanup_registry(&mut registry)?;
+            let shortcut_backend = app.try_state::<GlobalShortcut<tauri::Wry>>();
+
+            if let Some(shortcut_backend) = shortcut_backend {
+                let mut registry = TauriShortcutRegistry {
+                    shortcuts: shortcut_backend.inner(),
+                };
+                cleanup_registered_shortcuts(Some(&mut registry))?;
+            }
         }
+    }
+
+    Ok(())
+}
+
+fn cleanup_registered_shortcuts(
+    registry: Option<&mut impl ShortcutRegistry>,
+) -> Result<(), String> {
+    if let Some(registry) = registry {
+        cleanup_registry(registry)?;
     }
 
     Ok(())
@@ -702,6 +716,14 @@ mod tests {
         assert!(!registry.is_registered(active.shortcut));
         assert!(!registry.is_registered(stale.shortcut));
         assert_eq!(registry.history, vec![RegistryOperation::UnregisterAll]);
+    }
+
+    #[test]
+    fn cleanup_without_an_initialized_backend_is_a_noop() {
+        let registry: Option<&mut FakeShortcutRegistry> = None;
+
+        cleanup_registered_shortcuts(registry)
+            .expect("cleanup skips an unavailable shortcut backend");
     }
 
     #[test]
