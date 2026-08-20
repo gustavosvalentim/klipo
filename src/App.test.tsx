@@ -85,6 +85,12 @@ describe("App", () => {
 			expect(mocks.currentWindow.setFocus).toHaveBeenCalledOnce();
 		});
 
+		fireEvent.blur(window);
+
+		await waitFor(() => {
+			expect(screen.queryByRole("status")).toBeNull();
+		});
+
 		fireEvent.keyDown(window, { key: "Escape" });
 
 		await waitFor(() => {
