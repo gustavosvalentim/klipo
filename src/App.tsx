@@ -265,6 +265,7 @@ export function App() {
 
 	const handleBlur = useCallback(() => {
 		setSelectedItem(null);
+		setManualPasteCopied(false);
 	}, []);
 
 	const handleFocus = useCallback(() => {
