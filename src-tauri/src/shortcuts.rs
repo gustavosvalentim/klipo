@@ -7,7 +7,6 @@ use tauri_plugin_global_shortcut::{
 
 #[cfg(target_os = "linux")]
 use crate::desktop;
-#[cfg(any(target_os = "linux", test))]
 use crate::desktop::DesktopSession;
 use crate::settings::ShortcutSettings;
 use crate::state::AppState;
@@ -17,6 +16,25 @@ use crate::window::{capture_focused_window, get_main_window};
 pub enum ShortcutError {
     InputError,
     PoisonError,
+}
+
+pub fn supports_global_shortcuts(session: DesktopSession) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(session, DesktopSession::X11)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = session;
+        true
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = session;
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,31 +128,7 @@ fn global_shortcut_bindings(
     }])
 }
 
-pub fn initialize_global_shortcuts(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
-    if global_shortcuts_supported() {
-        register_shortcuts_plugin(app)?;
-        load_and_register_shortcuts(app)?;
-    } else {
-        let path = settings_path(app)?;
-        let saved = crate::settings::load(&path);
-        let active_settings = valid_or_default_settings(saved);
-        let state = app.state::<AppState>();
-        let mut shortcuts = state
-            .shortcuts
-            .lock()
-            .map_err(|_| tauri::Error::WindowNotFound)?;
-        *shortcuts = active_settings;
-        #[cfg(target_os = "linux")]
-        warn!(session:? = desktop::detect_session(); "Global shortcuts are disabled because the X11 backend is unavailable for this session");
-
-        #[cfg(not(target_os = "linux"))]
-        warn!("Global shortcuts are disabled because their backend is unavailable");
-    }
-
-    Ok(())
-}
-
-fn register_shortcuts_plugin(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
+pub fn register_shortcuts_plugin(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     #[cfg(desktop)]
     {
         let global_shortcut_handler = tauri_plugin_global_shortcut::Builder::new()
@@ -147,27 +141,40 @@ fn register_shortcuts_plugin(app: &tauri::AppHandle) -> Result<(), tauri::Error>
     Ok(())
 }
 
-fn load_and_register_shortcuts(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
-    let path = settings_path(app)?;
+pub fn load_shortcut_settings(app: &tauri::AppHandle) -> Result<(), String> {
+    let path = settings_path(app).map_err(|error| error.to_string())?;
     let saved = crate::settings::load(&path);
-    let active_settings = register_saved_or_default(app, saved);
+    let active_settings = valid_or_default_settings(saved);
     let state = app.state::<AppState>();
     let mut shortcuts = state
         .shortcuts
         .lock()
-        .map_err(|_| tauri::Error::WindowNotFound)?;
+        .map_err(|_| "Shortcut settings are unavailable".to_owned())?;
     *shortcuts = active_settings;
     Ok(())
 }
 
-fn valid_or_default_settings(settings: ShortcutSettings) -> ShortcutSettings {
-    match settings.validate() {
-        Ok(()) => settings,
-        Err(_) => ShortcutSettings::default(),
-    }
+pub fn register_loaded_shortcuts(app: &tauri::AppHandle) -> Result<(), String> {
+    let saved = app
+        .state::<AppState>()
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable".to_owned())?
+        .clone();
+    let active_settings = register_saved_or_default(app, saved)?;
+    let state = app.state::<AppState>();
+    let mut shortcuts = state
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable".to_owned())?;
+    *shortcuts = active_settings;
+    Ok(())
 }
 
-fn register_saved_or_default(app: &tauri::AppHandle, saved: ShortcutSettings) -> ShortcutSettings {
+fn register_saved_or_default(
+    app: &tauri::AppHandle,
+    saved: ShortcutSettings,
+) -> Result<ShortcutSettings, String> {
     #[cfg(desktop)]
     {
         let mut registry = TauriShortcutRegistry {
@@ -177,33 +184,32 @@ fn register_saved_or_default(app: &tauri::AppHandle, saved: ShortcutSettings) ->
     }
 
     #[cfg(not(desktop))]
-    valid_or_default_settings(saved)
+    Ok(valid_or_default_settings(saved))
 }
 
 fn register_saved_or_default_with(
     registry: &mut impl ShortcutRegistry,
     saved: ShortcutSettings,
-) -> ShortcutSettings {
+) -> Result<ShortcutSettings, String> {
     let saved_bindings = global_shortcut_bindings(&saved);
     if saved.validate().is_ok()
         && saved_bindings
             .as_ref()
             .is_ok_and(|bindings| register_bindings(registry, bindings).is_ok())
     {
-        saved
+        Ok(saved)
     } else {
         let defaults = ShortcutSettings::default();
-        match global_shortcut_bindings(&defaults) {
-            Ok(bindings) => {
-                if let Err(error_value) = register_bindings(registry, &bindings) {
-                    error!(error:% = error_value; "Failed to register default global shortcut");
-                }
-            }
-            Err(error_value) => {
-                error!(error:% = error_value; "Failed to select default global shortcut");
-            }
-        }
-        defaults
+        let bindings = global_shortcut_bindings(&defaults)?;
+        register_bindings(registry, &bindings)?;
+        Ok(defaults)
+    }
+}
+
+fn valid_or_default_settings(settings: ShortcutSettings) -> ShortcutSettings {
+    match settings.validate() {
+        Ok(()) => settings,
+        Err(_) => ShortcutSettings::default(),
     }
 }
 
@@ -685,10 +691,40 @@ mod tests {
         let expected = binding("SUPER+ALT+KeyK");
         let mut registry = FakeShortcutRegistry::default();
 
-        let active = register_saved_or_default_with(&mut registry, saved.clone());
+        let active = register_saved_or_default_with(&mut registry, saved.clone())
+            .expect("saved shortcut registration succeeds");
 
         assert_eq!(active, saved);
         assert!(registry.is_registered(expected.shortcut));
+    }
+
+    #[test]
+    fn startup_uses_defaults_when_the_saved_shortcut_is_invalid() {
+        let saved = ShortcutSettings {
+            open_klipo: "Escape".into(),
+            ..ShortcutSettings::default()
+        };
+        let expected = binding("SUPER+SHIFT+KeyV");
+        let mut registry = FakeShortcutRegistry::default();
+
+        let active = register_saved_or_default_with(&mut registry, saved)
+            .expect("default shortcut registration succeeds");
+
+        assert_eq!(active, ShortcutSettings::default());
+        assert!(registry.is_registered(expected.shortcut));
+    }
+
+    #[test]
+    fn startup_reports_when_saved_and_default_registration_are_unavailable() {
+        let defaults = ShortcutSettings::default();
+        let default_binding = binding("SUPER+SHIFT+KeyV");
+        let mut registry = FakeShortcutRegistry::default();
+        registry.register_failures.insert(default_binding.shortcut);
+
+        let error_value = register_saved_or_default_with(&mut registry, defaults)
+            .expect_err("startup reports an unavailable shortcut backend");
+
+        assert!(error_value.contains("backend refused registration"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use log::{debug, error};
 use tauri::{AppHandle, State};
 
 use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem, SystemClipboard};
+use crate::desktop::{DesktopCapabilities, DesktopCapability};
 use crate::input::simulate_paste_input;
 use crate::state::AppState;
 use crate::window::{get_main_window, restore_focused_window};
@@ -25,6 +26,11 @@ pub fn fetch_clipboard(state: State<'_, AppState>) -> Vec<ClipboardItem> {
 #[tauri::command]
 pub fn log_frontend_error(context: String, error: String) {
     error!(context:% = context, error:% = error; "Frontend error");
+}
+
+#[tauri::command]
+pub fn get_capabilities(state: State<'_, AppState>) -> Result<DesktopCapabilities, String> {
+    state.capabilities()
 }
 
 #[tauri::command]
@@ -50,8 +56,10 @@ pub fn save_shortcuts(
         .map_err(|_| "Shortcut settings are unavailable")?;
 
     let previous = active_shortcuts.clone();
+    let native_shortcuts_available = state.capability_is_available(DesktopCapability::Shortcut);
 
     save_shortcut_transaction(
+        native_shortcuts_available,
         &previous,
         &settings,
         || shortcuts::settings_path(&app).map_err(|error| error.to_string()),
@@ -65,6 +73,7 @@ pub fn save_shortcuts(
 }
 
 fn save_shortcut_transaction<Destination>(
+    replace_runtime: bool,
     previous: &ShortcutSettings,
     next: &ShortcutSettings,
     prepare_persistence: impl FnOnce() -> Result<Destination, String>,
@@ -73,10 +82,15 @@ fn save_shortcut_transaction<Destination>(
 ) -> Result<(), String> {
     let destination = prepare_persistence()?;
 
-    replace(previous, next)?;
+    if replace_runtime {
+        replace(previous, next)?;
+    }
 
     match persist(&destination, next) {
         Ok(()) => Ok(()),
+        Err(error_value) if !replace_runtime => {
+            Err(format!("Could not save shortcut settings: {error_value}"))
+        }
         Err(error_value) => match replace(next, previous) {
             Ok(()) => Err(format!(
                 "Could not save shortcut settings: {error_value}; restored the previous global shortcut binding"
@@ -118,7 +132,12 @@ pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) {
         return;
     };
 
-    if let Err(error_value) = write_to_clipboard(&state.system_clipboard, &item) {
+    let Some(system_clipboard) = state.system_clipboard.as_ref() else {
+        error!(capability = "clipboard_write", failure_category = "adapter_unavailable"; "Clipboard write is unavailable");
+        return;
+    };
+
+    if let Err(error_value) = write_to_clipboard(system_clipboard, &item) {
         error!(error:debug = error_value; "Failed to write item to clipboard");
         return;
     }
@@ -198,7 +217,12 @@ pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
 
     if item_idx == 0 {
         if let Some(item) = state.clipboard.first() {
-            if let Err(error_value) = write_to_clipboard(&state.system_clipboard, &item) {
+            let Some(system_clipboard) = state.system_clipboard.as_ref() else {
+                error!(capability = "clipboard_write", failure_category = "adapter_unavailable"; "Clipboard write is unavailable");
+                return;
+            };
+
+            if let Err(error_value) = write_to_clipboard(system_clipboard, &item) {
                 error!(error:debug = error_value; "Failed to write first item to clipboard");
             }
         }
@@ -218,6 +242,31 @@ mod tests {
     }
 
     #[test]
+    fn persists_shortcut_settings_without_touching_an_unavailable_plugin() {
+        let mut native_calls = 0;
+        let mut persisted = false;
+
+        let result = save_shortcut_transaction(
+            false,
+            &ShortcutSettings::default(),
+            &ShortcutSettings::default(),
+            || Ok(()),
+            |_, _| {
+                native_calls += 1;
+                Ok(())
+            },
+            |_, _| {
+                persisted = true;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(native_calls, 0);
+        assert!(persisted);
+    }
+
+    #[test]
     fn persistence_failure_restores_the_previous_runtime_binding() {
         let previous = ShortcutSettings::default();
         let mut next = ShortcutSettings::default();
@@ -225,6 +274,7 @@ mod tests {
         let mut replacements = Vec::new();
 
         let error_value = save_shortcut_transaction(
+            true,
             &previous,
             &next,
             || Ok(()),
@@ -254,6 +304,7 @@ mod tests {
         let mut replacement_attempted = false;
 
         let error_value = save_shortcut_transaction(
+            true,
             &previous,
             &next,
             || Err("settings directory is unavailable".into()),
@@ -277,6 +328,7 @@ mod tests {
         let mut replacements = Vec::new();
 
         let error_value = save_shortcut_transaction(
+            true,
             &previous,
             &next,
             || Ok(()),
