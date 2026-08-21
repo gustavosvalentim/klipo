@@ -1,6 +1,10 @@
 use enigo::Mouse;
 use log::{error, warn};
-use tauri::{LogicalPosition, LogicalSize, Manager, Position, Runtime, WebviewWindow};
+#[cfg(any(target_os = "linux", test))]
+use tauri::PhysicalPosition;
+#[cfg(not(target_os = "linux"))]
+use tauri::{LogicalPosition, LogicalSize};
+use tauri::{Manager, Position, Runtime, WebviewWindow};
 use tauri_plugin_global_shortcut::{
     GlobalShortcut, GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState,
 };
@@ -11,6 +15,8 @@ use crate::desktop::DesktopSession;
 use crate::settings::ShortcutSettings;
 use crate::state::AppState;
 use crate::window::{capture_focused_window, get_main_window};
+#[cfg(target_os = "linux")]
+use crate::window::{PICKER_HEIGHT, PICKER_WIDTH};
 
 #[derive(Debug)]
 pub enum ShortcutError {
@@ -126,6 +132,199 @@ fn global_shortcut_bindings(
         action: GlobalShortcutAction::OpenKlipo,
         shortcut: open_klipo,
     }])
+}
+
+fn show_on_cursor_handler(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if let Err(error_value) = capture_focused_window(&state) {
+        error!(error:debug = error_value; "Failed to get and store window state");
+    }
+
+    let Some(window) = get_main_window(app) else {
+        error!("Failed to get main window");
+        return;
+    };
+
+    #[cfg(target_os = "linux")]
+    let window_position = Position::Physical(get_linux_picker_position(app, &window));
+
+    #[cfg(not(target_os = "linux"))]
+    let window_position = Position::Logical(get_legacy_picker_position(app, &window));
+
+    if let Err(error_value) = window.set_position(window_position) {
+        error!(error:debug = error_value; "Failed to position window");
+        return;
+    }
+
+    let window = window.clone();
+    // this is a hack to make the window appear on the correct
+    // position without flickering.
+    // Because tauri window methods are async, show() may run before
+    // set_position() finishes, causing the window to briefly appear
+    // on the old position before moving to the new one.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        if let Err(error_value) = window.show() {
+            error!(error:debug = error_value; "Failed to show window");
+        }
+
+        if let Err(error_value) = window.set_focus() {
+            error!(error:debug = error_value; "Failed to focus window");
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PhysicalRectangle {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl PhysicalRectangle {
+    fn contains(self, point: PhysicalPosition<i32>) -> bool {
+        let point_x = i64::from(point.x);
+        let point_y = i64::from(point.y);
+        let right = i64::from(self.x) + i64::from(self.width);
+        let bottom = i64::from(self.y) + i64::from(self.height);
+
+        point_x >= i64::from(self.x)
+            && point_x < right
+            && point_y >= i64::from(self.y)
+            && point_y < bottom
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MonitorGeometry {
+    bounds: PhysicalRectangle,
+    work_area: PhysicalRectangle,
+    is_primary: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resolve_picker_position(
+    pointer: Option<PhysicalPosition<i32>>,
+    monitors: &[MonitorGeometry],
+    picker_size: (u32, u32),
+) -> Option<PhysicalPosition<i32>> {
+    let monitor_at_pointer = pointer.and_then(|point| {
+        monitors
+            .iter()
+            .find(|monitor| monitor.bounds.contains(point))
+    });
+    let selected_monitor = monitor_at_pointer
+        .or_else(|| monitors.iter().find(|monitor| monitor.is_primary))
+        .or_else(|| monitors.first())?;
+
+    let fallback_position =
+        PhysicalPosition::new(selected_monitor.work_area.x, selected_monitor.work_area.y);
+    let pointer_position = if monitor_at_pointer.is_some() {
+        pointer.unwrap_or(fallback_position)
+    } else {
+        fallback_position
+    };
+
+    Some(PhysicalPosition::new(
+        clamp_picker_axis(
+            pointer_position.x,
+            selected_monitor.work_area.x,
+            selected_monitor.work_area.width,
+            picker_size.0,
+        ),
+        clamp_picker_axis(
+            pointer_position.y,
+            selected_monitor.work_area.y,
+            selected_monitor.work_area.height,
+            picker_size.1,
+        ),
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn clamp_picker_axis(pointer: i32, work_start: i32, work_length: u32, picker_length: u32) -> i32 {
+    let work_start = i64::from(work_start);
+    let work_end = work_start + i64::from(work_length);
+    let picker_end = work_end - i64::from(picker_length);
+    let clamped_position = if picker_end >= work_start {
+        i64::from(pointer).clamp(work_start, picker_end)
+    } else {
+        // A picker larger than the usable area cannot fit fully, so anchor it at
+        // the work-area origin to keep as much of it visible as possible.
+        work_start
+    };
+
+    clamped_position.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+#[cfg(target_os = "linux")]
+fn get_linux_picker_position(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> PhysicalPosition<i32> {
+    let picker_size = window
+        .inner_size()
+        .map(|size| (size.width, size.height))
+        .unwrap_or_else(|error_value| {
+            warn!(error:debug = error_value; "Failed to measure picker size; using configured size");
+            (PICKER_WIDTH.round() as u32, PICKER_HEIGHT.round() as u32)
+        });
+    let monitors = match app.available_monitors() {
+        Ok(monitors) => monitors,
+        Err(error_value) => {
+            warn!(error:debug = error_value; "Failed to list monitors; using origin");
+            return PhysicalPosition::new(0, 0);
+        }
+    };
+    let primary_monitor = match app.primary_monitor() {
+        Ok(monitor) => monitor,
+        Err(error_value) => {
+            warn!(error:debug = error_value; "Failed to get primary monitor; using first monitor");
+            None
+        }
+    };
+    let monitor_geometries = monitors
+        .iter()
+        .map(|monitor| MonitorGeometry {
+            bounds: PhysicalRectangle {
+                x: monitor.position().x,
+                y: monitor.position().y,
+                width: monitor.size().width,
+                height: monitor.size().height,
+            },
+            work_area: PhysicalRectangle {
+                x: monitor.work_area().position.x,
+                y: monitor.work_area().position.y,
+                width: monitor.work_area().size.width,
+                height: monitor.work_area().size.height,
+            },
+            is_primary: primary_monitor
+                .as_ref()
+                .is_some_and(|primary| monitors_match(monitor, primary)),
+        })
+        .collect::<Vec<_>>();
+    let pointer = get_cursor_position(app)
+        .map(|(x, y)| PhysicalPosition::new(x, y))
+        .map_err(|error_value| {
+            warn!(error:debug = error_value; "Failed to get cursor position; using primary monitor");
+            error_value
+        })
+        .ok();
+
+    resolve_picker_position(pointer, &monitor_geometries, picker_size).unwrap_or_else(|| {
+        warn!("No monitor is available; using origin");
+        PhysicalPosition::new(0, 0)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn monitors_match(left: &tauri::Monitor, right: &tauri::Monitor) -> bool {
+    left.position() == right.position() && left.size() == right.size()
 }
 
 pub fn register_shortcuts_plugin(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
@@ -442,47 +641,25 @@ fn global_shortcut_handler(app: &tauri::AppHandle, shortcut: &Shortcut, event: S
     }
 }
 
-fn show_on_cursor_handler(app: &tauri::AppHandle) {
-    let state = app.state::<AppState>();
-    if let Err(error_value) = capture_focused_window(&state) {
-        error!(error:debug = error_value; "Failed to get and store window state");
-    }
-
-    let Some(window) = get_main_window(app) else {
-        error!("Failed to get main window");
-        return;
-    };
-
+#[cfg(not(target_os = "linux"))]
+fn get_legacy_picker_position(
+    app: &tauri::AppHandle,
+    window: &WebviewWindow,
+) -> LogicalPosition<f64> {
     let (mouse_x, mouse_y) = get_cursor_position(app).unwrap_or_else(|error_value| {
         warn!(error:debug = error_value; "Failed to get cursor position; using origin");
         (0, 0)
     });
+    let window_size = get_window_logical_size(window);
+    let monitor_size = get_screen_logical_size(window);
 
-    let window_size = get_window_logical_size(&window);
-    let monitor_size = get_screen_logical_size(&window);
-    let x = f64::from(mouse_x).clamp(0.0, monitor_size.width - window_size.width);
-    let y = f64::from(mouse_y).clamp(0.0, monitor_size.height - window_size.height);
-    let window_position = LogicalPosition { x, y };
-
-    if let Err(error_value) = window.set_position(Position::Logical(window_position)) {
-        error!(error:debug = error_value; "Failed to position window");
-        return;
+    LogicalPosition {
+        x: f64::from(mouse_x).clamp(0.0, monitor_size.width - window_size.width),
+        y: f64::from(mouse_y).clamp(0.0, monitor_size.height - window_size.height),
     }
-
-    let window = window.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
-        if let Err(error_value) = window.show() {
-            error!(error:debug = error_value; "Failed to show window");
-        }
-
-        if let Err(error_value) = window.set_focus() {
-            error!(error:debug = error_value; "Failed to focus window");
-        }
-    });
 }
 
+#[cfg(not(target_os = "linux"))]
 fn get_window_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
     let Ok(window_size) = window.inner_size() else {
         return LogicalSize {
@@ -494,6 +671,7 @@ fn get_window_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
     window_size.to_logical(window.scale_factor().unwrap_or(1.0))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn get_screen_logical_size(window: &WebviewWindow) -> LogicalSize<f64> {
     let Ok(Some(monitor)) = window.current_monitor() else {
         return LogicalSize {
@@ -524,6 +702,283 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    const PICKER_SIZE: (u32, u32) = (250, 350);
+
+    fn monitor(
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        work_area: PhysicalRectangle,
+        _scale_factor: f64,
+        is_primary: bool,
+    ) -> MonitorGeometry {
+        MonitorGeometry {
+            bounds: PhysicalRectangle {
+                x,
+                y,
+                width,
+                height,
+            },
+            work_area,
+            is_primary,
+        }
+    }
+
+    fn work_area(x: i32, y: i32, width: u32, height: u32) -> PhysicalRectangle {
+        PhysicalRectangle {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn position_for(
+        pointer: Option<(i32, i32)>,
+        monitors: &[MonitorGeometry],
+    ) -> PhysicalPosition<i32> {
+        let pointer = pointer.map(|(x, y)| PhysicalPosition::new(x, y));
+
+        resolve_picker_position(pointer, monitors, PICKER_SIZE)
+            .expect("a monitor should resolve a position")
+    }
+
+    fn is_within_work_area(
+        position: PhysicalPosition<i32>,
+        picker_size: (u32, u32),
+        work_area: PhysicalRectangle,
+    ) -> bool {
+        let picker_right = i64::from(position.x) + i64::from(picker_size.0);
+        let picker_bottom = i64::from(position.y) + i64::from(picker_size.1);
+        let work_right = i64::from(work_area.x) + i64::from(work_area.width);
+        let work_bottom = i64::from(work_area.y) + i64::from(work_area.height);
+
+        i64::from(position.x) >= i64::from(work_area.x)
+            && picker_right <= work_right
+            && i64::from(position.y) >= i64::from(work_area.y)
+            && picker_bottom <= work_bottom
+    }
+
+    fn intersects_work_area(
+        position: PhysicalPosition<i32>,
+        picker_size: (u32, u32),
+        work_area: PhysicalRectangle,
+    ) -> bool {
+        let picker_right = i64::from(position.x) + i64::from(picker_size.0);
+        let picker_bottom = i64::from(position.y) + i64::from(picker_size.1);
+        let work_right = i64::from(work_area.x) + i64::from(work_area.width);
+        let work_bottom = i64::from(work_area.y) + i64::from(work_area.height);
+
+        i64::from(position.x) < work_right
+            && picker_right > i64::from(work_area.x)
+            && i64::from(position.y) < work_bottom
+            && picker_bottom > i64::from(work_area.y)
+    }
+
+    #[test]
+    fn positions_picker_on_primary_monitor_and_clamps_at_its_edges() {
+        let primary = monitor(0, 0, 1920, 1080, work_area(0, 0, 1920, 1040), 1.0, true);
+
+        assert_eq!(
+            position_for(Some((500, 400)), &[primary]),
+            PhysicalPosition::new(500, 400)
+        );
+        assert_eq!(
+            position_for(Some((1919, 1079)), &[primary]),
+            PhysicalPosition::new(1670, 690)
+        );
+    }
+
+    #[test]
+    fn selects_secondary_monitors_with_positive_and_negative_origins() {
+        let left = monitor(
+            -1280,
+            0,
+            1280,
+            1024,
+            work_area(-1280, 0, 1280, 1024),
+            1.0,
+            false,
+        );
+        let primary = monitor(0, 0, 1920, 1080, work_area(0, 0, 1920, 1080), 1.0, true);
+        let right = monitor(
+            1920,
+            0,
+            1600,
+            900,
+            work_area(1920, 0, 1600, 900),
+            1.0,
+            false,
+        );
+
+        assert_eq!(
+            position_for(Some((-1200, 200)), &[left, primary, right]),
+            PhysicalPosition::new(-1200, 200)
+        );
+        assert_eq!(
+            position_for(Some((3500, 850)), &[left, primary, right]),
+            PhysicalPosition::new(3270, 550)
+        );
+    }
+
+    #[test]
+    fn preserves_negative_vertical_origins() {
+        let above_primary = monitor(
+            0,
+            -900,
+            1600,
+            900,
+            work_area(0, -900, 1600, 900),
+            1.0,
+            false,
+        );
+        let primary = monitor(0, 0, 1920, 1080, work_area(0, 0, 1920, 1080), 1.0, true);
+
+        assert_eq!(
+            position_for(Some((400, -10)), &[above_primary, primary]),
+            PhysicalPosition::new(400, -350)
+        );
+    }
+
+    #[test]
+    fn clamps_to_work_area_instead_of_full_monitor_bounds() {
+        let primary = monitor(0, 0, 1920, 1080, work_area(0, 32, 1920, 1008), 1.0, true);
+
+        assert_eq!(
+            position_for(Some((20, 10)), &[primary]),
+            PhysicalPosition::new(20, 32)
+        );
+        assert_eq!(
+            position_for(Some((1900, 1070)), &[primary]),
+            PhysicalPosition::new(1670, 690)
+        );
+    }
+
+    #[test]
+    fn uses_measured_picker_size_on_mixed_scale_monitors() {
+        let primary = monitor(0, 0, 1920, 1080, work_area(0, 0, 1920, 1080), 1.0, true);
+        // X11 can report the primary output's scale for every monitor even when
+        // the secondary output transforms its pixels differently.
+        let scaled_secondary = monitor(
+            1920,
+            0,
+            2560,
+            1440,
+            work_area(1920, 0, 2560, 1440),
+            1.0,
+            false,
+        );
+
+        // This is the physical size measured from the picker window itself.
+        assert_eq!(
+            resolve_picker_position(
+                Some(PhysicalPosition::new(4400, 1300)),
+                &[primary, scaled_secondary],
+                (375, 525),
+            )
+            .expect("a monitor should resolve a position"),
+            PhysicalPosition::new(4105, 915)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_primary_or_first_monitor_when_pointer_is_unavailable() {
+        let left = monitor(
+            -1280,
+            0,
+            1280,
+            1024,
+            work_area(-1280, 0, 1280, 1024),
+            1.0,
+            false,
+        );
+        let negative_origin_primary = monitor(
+            -1920,
+            0,
+            640,
+            480,
+            work_area(-1920, 20, 640, 460),
+            1.0,
+            true,
+        );
+
+        assert_eq!(
+            position_for(None, &[left, negative_origin_primary]),
+            PhysicalPosition::new(-1920, 20)
+        );
+        assert_eq!(position_for(None, &[left]), PhysicalPosition::new(-1280, 0));
+    }
+
+    #[test]
+    fn falls_back_when_pointer_is_outside_every_monitor() {
+        let primary = monitor(
+            -1920,
+            0,
+            1920,
+            1080,
+            work_area(-1920, 0, 1920, 1080),
+            1.0,
+            true,
+        );
+
+        assert_eq!(
+            position_for(Some((500, 500)), &[primary]),
+            PhysicalPosition::new(-1920, 0)
+        );
+    }
+
+    #[test]
+    fn topology_matrix_keeps_a_fitting_picker_inside_each_work_area() {
+        let monitors = [
+            monitor(
+                -1600,
+                -900,
+                1600,
+                900,
+                work_area(-1600, -900, 1600, 900),
+                1.0,
+                false,
+            ),
+            monitor(0, 0, 1920, 1080, work_area(0, 24, 1920, 1056), 1.0, true),
+            monitor(
+                1920,
+                0,
+                2560,
+                1440,
+                work_area(1920, 0, 2560, 1400),
+                1.5,
+                false,
+            ),
+        ];
+        let pointer_positions = [
+            (-1600, -900),
+            (-1, -1),
+            (0, 0),
+            (1919, 1079),
+            (1920, 0),
+            (4479, 1439),
+        ];
+
+        for pointer in pointer_positions {
+            let position = position_for(Some(pointer), &monitors);
+            let selected_monitor = monitors
+                .iter()
+                .find(|monitor| {
+                    monitor
+                        .bounds
+                        .contains(PhysicalPosition::new(pointer.0, pointer.1))
+                })
+                .expect("test pointer should be on a monitor");
+
+            assert!(is_within_work_area(
+                position,
+                PICKER_SIZE,
+                selected_monitor.work_area,
+            ));
+        }
+    }
 
     #[derive(Default)]
     struct FakeShortcutRegistry {
@@ -591,6 +1046,27 @@ mod tests {
             action: GlobalShortcutAction::OpenKlipo,
             shortcut: shortcut.parse().expect("test shortcut parses"),
         }
+    }
+
+    #[test]
+    fn oversized_picker_stays_visible_instead_of_resolving_outside_the_work_area() {
+        let primary = monitor(
+            -100,
+            -100,
+            200,
+            200,
+            work_area(-100, -100, 200, 200),
+            1.0,
+            true,
+        );
+        let position = position_for(Some((-50, -50)), &[primary]);
+
+        assert_eq!(position, PhysicalPosition::new(-100, -100));
+        assert!(intersects_work_area(
+            position,
+            PICKER_SIZE,
+            primary.work_area
+        ));
     }
 
     #[test]
