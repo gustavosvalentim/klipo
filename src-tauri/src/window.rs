@@ -14,8 +14,8 @@ pub struct Settings {
     pub decorations: bool,
 }
 
-const PICKER_WIDTH: f64 = 250.0;
-const PICKER_HEIGHT: f64 = 350.0;
+pub(crate) const PICKER_WIDTH: f64 = 250.0;
+pub(crate) const PICKER_HEIGHT: f64 = 350.0;
 
 #[derive(Debug)]
 pub enum WindowError {
