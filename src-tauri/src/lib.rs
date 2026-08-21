@@ -7,20 +7,27 @@ mod settings;
 mod shortcuts;
 #[cfg(any(target_os = "linux", test))]
 mod single_instance;
+mod startup;
 mod state;
 mod storage;
 mod tray;
 mod window;
 
-use clipboard::ClipboardEventsListener;
+use clipboard::{ClipboardEventsListener, SystemClipboard};
 use commands::{
-    clear, close, delete_item, fetch_clipboard, get_shortcuts, log_frontend_error, paste, quit,
-    save_shortcuts,
+    clear, close, delete_item, fetch_clipboard, get_capabilities, get_shortcuts,
+    log_frontend_error, paste, quit, save_shortcuts,
 };
-use log::{error, info};
-use shortcuts::{cleanup_global_shortcuts, initialize_global_shortcuts};
+use desktop::{CapabilityUnavailableReason, DesktopCapability, DesktopSession};
+use input::supports_input;
+use log::{error, info, warn};
+use shortcuts::{
+    cleanup_global_shortcuts, load_shortcut_settings, register_loaded_shortcuts,
+    register_shortcuts_plugin, supports_global_shortcuts,
+};
 #[cfg(target_os = "linux")]
 use single_instance::PickerActivation;
+use startup::{StartupCoordinator, StartupStep};
 use state::AppState;
 use tauri::Manager;
 use window::{create_picker_window, window_events_handler};
@@ -40,6 +47,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             fetch_clipboard,
+            get_capabilities,
             log_frontend_error,
             paste,
             clear,
@@ -111,25 +119,294 @@ fn initialize_application(app: &mut tauri::App) -> Result<(), Box<dyn std::error
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+    let session = desktop::detect_session();
+    let mut startup = StartupCoordinator::new(session);
     let data_directory = app.path().app_data_dir()?;
     std::fs::create_dir_all(&data_directory)?;
-    let app_state = AppState::new(data_directory.join("clipboard.sqlite3"))?;
-    if let Err(error) = app_state.input.enable() {
-        // TODO: display window asking for accessibility permissions
-        error!(error:debug = error; "Failed to enable input");
-    }
+    let mut app_state = AppState::new(data_directory.join("clipboard.sqlite3"), session)?;
+
+    startup.run_steps(&StartupStep::ALL[..3], |step, startup| match step {
+        StartupStep::Clipboard => initialize_system_clipboard(&mut app_state, startup, session),
+        StartupStep::Input => initialize_input(&app_state, startup, session),
+        StartupStep::TargetRestoration => set_target_restoration_capability(startup, session),
+        StartupStep::Shortcut | StartupStep::Tray | StartupStep::Watcher | StartupStep::Window => {}
+    });
+    app_state.replace_capabilities(startup.capabilities());
     app.manage(app_state);
 
     let app_handle = app.handle().clone();
 
-    initialize_global_shortcuts(&app_handle)?;
-    tray::create(&app_handle)?;
-    create_picker_window(&app_handle).map_err(|_| tauri::Error::WindowNotFound)?;
-
-    // TODO: implement shutdown
-    let listener = ClipboardEventsListener::new(app_handle)?;
-    std::thread::spawn(move || listener.start());
+    startup.run_steps(&StartupStep::ALL[3..], |step, startup| match step {
+        StartupStep::Shortcut => initialize_shortcuts(&app_handle, startup, session),
+        StartupStep::Tray => initialize_tray(&app_handle, startup, session),
+        StartupStep::Watcher => initialize_clipboard_watcher(&app_handle, startup, session),
+        StartupStep::Window => initialize_window(&app_handle, startup, session),
+        StartupStep::Clipboard | StartupStep::Input | StartupStep::TargetRestoration => {}
+    });
 
     info!("Application started");
     Ok(())
+}
+
+fn initialize_system_clipboard(
+    state: &mut AppState,
+    startup: &mut StartupCoordinator,
+    session: DesktopSession,
+) {
+    match startup.run_capability(
+        &[
+            DesktopCapability::ClipboardRead,
+            DesktopCapability::ClipboardWrite,
+        ],
+        SystemClipboard::new,
+        |_| CapabilityUnavailableReason::InitializationFailed,
+    ) {
+        Ok(system_clipboard) => state.install_system_clipboard(system_clipboard),
+        Err(error_value) => log_startup_failure(
+            session,
+            DesktopCapability::ClipboardRead,
+            CapabilityUnavailableReason::InitializationFailed,
+            &error_value,
+        ),
+    }
+}
+
+fn initialize_input(state: &AppState, startup: &mut StartupCoordinator, session: DesktopSession) {
+    let input_is_supported = supports_input(session);
+    let input_result = startup.run_capability(
+        &[DesktopCapability::Input, DesktopCapability::Pointer],
+        || {
+            if input_is_supported {
+                state.input.enable().map_err(|error| format!("{error:?}"))
+            } else {
+                Err("input simulation is not supported by this desktop session".to_owned())
+            }
+        },
+        |_| {
+            if input_is_supported {
+                CapabilityUnavailableReason::InitializationFailed
+            } else {
+                session_unavailable_reason(session)
+            }
+        },
+    );
+
+    if let Err(error_value) = input_result {
+        let reason = if input_is_supported {
+            CapabilityUnavailableReason::InitializationFailed
+        } else {
+            session_unavailable_reason(session)
+        };
+        log_startup_failure(session, DesktopCapability::Input, reason, &error_value);
+    }
+}
+
+fn initialize_shortcuts(
+    app: &tauri::AppHandle,
+    startup: &mut StartupCoordinator,
+    session: DesktopSession,
+) {
+    let state = app.state::<AppState>();
+
+    if let Err(error_value) = load_shortcut_settings(app) {
+        log_startup_failure(
+            session,
+            DesktopCapability::Shortcut,
+            CapabilityUnavailableReason::InitializationFailed,
+            &error_value,
+        );
+    }
+
+    let result = startup.run_capability(
+        &[DesktopCapability::Shortcut],
+        || {
+            if supports_global_shortcuts(session) {
+                register_shortcuts_plugin(app)
+                    .map_err(|error| {
+                        (
+                            CapabilityUnavailableReason::InitializationFailed,
+                            error.to_string(),
+                        )
+                    })
+                    .and_then(|_| {
+                        register_loaded_shortcuts(app).map_err(|error| {
+                            (CapabilityUnavailableReason::InitializationFailed, error)
+                        })
+                    })
+            } else {
+                Err((
+                    session_unavailable_reason(session),
+                    "global shortcuts are not supported by this session".to_owned(),
+                ))
+            }
+        },
+        |failure| failure.0,
+    );
+
+    if let Err((reason, error_value)) = result {
+        log_startup_failure(session, DesktopCapability::Shortcut, reason, &error_value);
+    }
+
+    state.replace_capabilities(startup.capabilities());
+}
+
+fn initialize_tray(
+    app: &tauri::AppHandle,
+    startup: &mut StartupCoordinator,
+    session: DesktopSession,
+) {
+    let state = app.state::<AppState>();
+
+    let result = startup.run_capability(
+        &[DesktopCapability::Tray],
+        || tray::create(app),
+        |_| CapabilityUnavailableReason::InitializationFailed,
+    );
+
+    if let Err(error_value) = result {
+        log_startup_failure(
+            session,
+            DesktopCapability::Tray,
+            CapabilityUnavailableReason::InitializationFailed,
+            &error_value,
+        );
+    }
+
+    state.replace_capabilities(startup.capabilities());
+}
+
+fn initialize_window(
+    app: &tauri::AppHandle,
+    startup: &mut StartupCoordinator,
+    session: DesktopSession,
+) {
+    if let Err(error_value) = startup.run_shell_step(|| create_picker_window(app)) {
+        warn!(
+            session:? = session,
+            backend = std::env::consts::OS,
+            capability = "window",
+            failure_category = "initialization_failed",
+            error:debug = error_value;
+            "Klipo window is unavailable; the shell will continue"
+        );
+    }
+}
+
+fn initialize_clipboard_watcher(
+    app: &tauri::AppHandle,
+    startup: &mut StartupCoordinator,
+    session: DesktopSession,
+) {
+    let state = app.state::<AppState>();
+
+    let result = startup.run_capability(
+        &[DesktopCapability::Watcher],
+        || {
+            state
+                .system_clipboard
+                .as_ref()
+                .ok_or_else(|| "system clipboard initialization failed".to_owned())?;
+            ClipboardEventsListener::new(app.clone()).map_err(|error| error.to_string())
+        },
+        |_| CapabilityUnavailableReason::InitializationFailed,
+    );
+
+    match result {
+        Ok(listener) => {
+            std::thread::spawn(move || listener.start());
+        }
+        Err(error_value) => log_startup_failure(
+            session,
+            DesktopCapability::Watcher,
+            CapabilityUnavailableReason::InitializationFailed,
+            &error_value,
+        ),
+    }
+
+    state.replace_capabilities(startup.capabilities());
+}
+
+fn set_target_restoration_capability(startup: &mut StartupCoordinator, session: DesktopSession) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = session;
+        let _ = startup.run_capability(
+            &[DesktopCapability::TargetRestoration],
+            || Ok::<(), CapabilityUnavailableReason>(()),
+            |reason| *reason,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let reason = target_restoration_unavailable_reason(session);
+        let result = startup.run_capability(
+            &[DesktopCapability::TargetRestoration],
+            || Err::<(), _>(reason),
+            |reason| *reason,
+        );
+        if let Err(error_value) = result {
+            log_startup_failure(
+                session,
+                DesktopCapability::TargetRestoration,
+                error_value,
+                &"target restoration is not implemented for this platform",
+            );
+        }
+    }
+}
+
+fn session_unavailable_reason(session: DesktopSession) -> CapabilityUnavailableReason {
+    match session {
+        DesktopSession::Unknown => CapabilityUnavailableReason::UnknownSession,
+        DesktopSession::X11 | DesktopSession::Wayland => {
+            CapabilityUnavailableReason::UnsupportedSession
+        }
+    }
+}
+
+#[cfg(any(test, not(target_os = "macos")))]
+fn target_restoration_unavailable_reason(session: DesktopSession) -> CapabilityUnavailableReason {
+    match session {
+        DesktopSession::X11 => CapabilityUnavailableReason::AdapterUnavailable,
+        DesktopSession::Wayland => CapabilityUnavailableReason::UnsupportedSession,
+        DesktopSession::Unknown => CapabilityUnavailableReason::UnknownSession,
+    }
+}
+
+fn log_startup_failure(
+    session: DesktopSession,
+    capability: DesktopCapability,
+    reason: CapabilityUnavailableReason,
+    error_value: &impl std::fmt::Debug,
+) {
+    warn!(
+        session:? = session,
+        backend = std::env::consts::OS,
+        capability:? = capability,
+        failure_category:? = reason,
+        error:debug = error_value;
+        "Desktop integration unavailable; continuing startup"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_target_restoration_failures_to_session_specific_reasons() {
+        assert_eq!(
+            target_restoration_unavailable_reason(DesktopSession::X11),
+            CapabilityUnavailableReason::AdapterUnavailable
+        );
+        assert_eq!(
+            target_restoration_unavailable_reason(DesktopSession::Wayland),
+            CapabilityUnavailableReason::UnsupportedSession
+        );
+        assert_eq!(
+            target_restoration_unavailable_reason(DesktopSession::Unknown),
+            CapabilityUnavailableReason::UnknownSession
+        );
+    }
 }

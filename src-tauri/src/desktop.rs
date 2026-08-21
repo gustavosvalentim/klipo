@@ -70,6 +70,14 @@ pub enum CapabilityStatus {
 }
 
 impl CapabilityStatus {
+    pub const fn available() -> Self {
+        Self::Available
+    }
+
+    pub const fn unavailable(reason: CapabilityUnavailableReason) -> Self {
+        Self::Unavailable { reason }
+    }
+
     fn from_probe(result: Result<(), CapabilityUnavailableReason>) -> Self {
         match result {
             Ok(()) => Self::Available,
@@ -99,6 +107,10 @@ pub struct DesktopCapabilities {
 }
 
 impl DesktopCapabilities {
+    pub fn unavailable(session: DesktopSession, reason: CapabilityUnavailableReason) -> Self {
+        Self::from_statuses(session, |_| CapabilityStatus::unavailable(reason))
+    }
+
     fn from_statuses(
         session: DesktopSession,
         mut status_for: impl FnMut(DesktopCapability) -> CapabilityStatus,
@@ -138,6 +150,23 @@ impl DesktopCapabilities {
             DesktopCapability::AutomaticPaste => self.automatic_paste,
             DesktopCapability::Tray => self.tray,
         }
+    }
+
+    pub fn set_status(&mut self, capability: DesktopCapability, status: CapabilityStatus) {
+        match capability {
+            DesktopCapability::ClipboardRead => self.clipboard_read = status,
+            DesktopCapability::ClipboardWrite => self.clipboard_write = status,
+            DesktopCapability::Watcher => self.watcher = status,
+            DesktopCapability::Shortcut => self.shortcut = status,
+            DesktopCapability::Pointer => self.pointer = status,
+            DesktopCapability::TargetRestoration => self.target_restoration = status,
+            DesktopCapability::Input => self.input = status,
+            DesktopCapability::AutomaticPaste => {}
+            DesktopCapability::Tray => self.tray = status,
+        }
+
+        self.automatic_paste =
+            automatic_paste_status(self.clipboard_write, self.target_restoration, self.input);
     }
 }
 

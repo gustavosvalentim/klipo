@@ -2,6 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type DesktopCapabilities,
+	unavailableCapabilityMessages,
+} from "./capabilities";
 import { ClearHistoryButton } from "./components/ClearHistoryButton";
 import { ListItem } from "./components/ListItem";
 import { logError } from "./log";
@@ -56,6 +60,9 @@ function App() {
 	const [clipboard, setClipboard] = useState<Clipboard>([]);
 	const [selectedItem, setSelectedItem] = useState<number | null>(null);
 	const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
+	const [capabilities, setCapabilities] = useState<DesktopCapabilities | null>(
+		null,
+	);
 	const platformPresentation = getPlatformPresentation();
 
 	const historyRef = useRef<HTMLDivElement>(null);
@@ -74,6 +81,21 @@ function App() {
 			logError("Failed to get clipboard history", error);
 		}
 	}, []);
+
+	const loadCapabilities = useCallback(async () => {
+		try {
+			const capabilities =
+				await invoke<DesktopCapabilities>("get_capabilities");
+			setCapabilities(capabilities);
+		} catch (error) {
+			logError("Failed to get desktop capabilities", error);
+		}
+	}, []);
+
+	const unavailableCapabilities = useMemo(
+		() => (capabilities ? unavailableCapabilityMessages(capabilities) : []),
+		[capabilities],
+	);
 
 	const clearHistory = useCallback(async () => {
 		try {
@@ -188,6 +210,10 @@ function App() {
 	}, [fetchClipboardHistory]);
 
 	useEffect(() => {
+		loadCapabilities();
+	}, [loadCapabilities]);
+
+	useEffect(() => {
 		const unlisten = listen<string>("clipboard-changed", async () => {
 			const isVisible = await getCurrentWindow().isVisible();
 
@@ -227,6 +253,14 @@ function App() {
 				</div>
 
 				<MenuSeparator />
+
+				{unavailableCapabilities.length > 0 && (
+					<div className="menu__capabilities" role="status">
+						{unavailableCapabilities.map((message) => (
+							<p key={message}>{message}</p>
+						))}
+					</div>
+				)}
 
 				<div ref={historyRef} className="menu__history">
 					{clipboardMenuItems.map((item, idx) => (

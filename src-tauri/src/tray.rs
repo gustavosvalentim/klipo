@@ -5,20 +5,17 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use crate::window::show_settings_window;
 
 pub fn create(app: &tauri::AppHandle) -> Result<TrayIcon, tauri::Error> {
-    let Ok(settings_item) = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)
-    else {
-        panic!("Failed to create settings menu item");
-    };
-    let Ok(quit_item) = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>) else {
-        panic!("Failed to create quit menu item");
-    };
+    let settings_item = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let Ok(menu) = Menu::with_items(app, &[&settings_item, &quit_item]) else {
-        panic!("Failed to create menu");
-    };
+    let menu = Menu::with_items(app, &[&settings_item, &quit_item])?;
 
     TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(
+            app.default_window_icon()
+                .ok_or(tauri::Error::WindowNotFound)?
+                .clone(),
+        )
         .icon_as_template(true)
         .tooltip("Klipo")
         .menu(&menu)

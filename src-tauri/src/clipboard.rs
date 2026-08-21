@@ -11,7 +11,7 @@ use log::{debug, error};
 use tauri::{Emitter, Manager};
 
 use crate::state::AppState;
-use crate::window::get_focused_window;
+use crate::window::is_klipo_focused;
 
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {
@@ -332,17 +332,16 @@ impl ClipboardHandler for ClipboardEventsHandler {
     fn on_clipboard_change(&mut self) {
         debug!("Clipboard changed");
 
-        let klipo_pid = std::process::id();
-        let focused_window_pid = get_focused_window();
-
-        if let Some(focused_window_pid) = focused_window_pid {
-            if focused_window_pid as u32 == klipo_pid {
-                return;
-            }
+        if is_klipo_focused() {
+            return;
         }
 
         let state = self.app.state::<AppState>();
-        let accepted = capture_clipboard_change(&state.system_clipboard, &state.clipboard);
+        let Some(system_clipboard) = state.system_clipboard.as_ref() else {
+            error!(capability = "clipboard_read", failure_category = "adapter_unavailable"; "Clipboard capture is unavailable");
+            return;
+        };
+        let accepted = capture_clipboard_change(system_clipboard, &state.clipboard);
 
         match accepted {
             Ok(true) => {

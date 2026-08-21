@@ -2,6 +2,8 @@ use std::sync::Mutex;
 
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
+use crate::desktop::DesktopSession;
+
 trait KeyInput {
     fn key(&mut self, key: Key, direction: Direction) -> Result<(), enigo::InputError>;
 }
@@ -52,6 +54,18 @@ fn simulate_paste_input_with(input: &mut impl KeyInput, mod_key: Key) -> Result<
     match (click_result, release_result) {
         (Err(error), _) | (_, Err(error)) => Err(InputError::InputSimError(error)),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+pub fn supports_input(session: DesktopSession) -> bool {
+    supports_input_on(std::env::consts::OS, session)
+}
+
+fn supports_input_on(platform: &str, session: DesktopSession) -> bool {
+    match platform {
+        "macos" => true,
+        "linux" => matches!(session, DesktopSession::X11),
+        _ => false,
     }
 }
 
@@ -179,6 +193,14 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(input.calls, expected_calls(Key::Meta));
+    }
+
+    #[test]
+    fn limits_linux_input_to_x11_but_preserves_macos_support() {
+        assert!(supports_input_on("linux", DesktopSession::X11));
+        assert!(!supports_input_on("linux", DesktopSession::Wayland));
+        assert!(!supports_input_on("linux", DesktopSession::Unknown));
+        assert!(supports_input_on("macos", DesktopSession::Unknown));
     }
 }
 
