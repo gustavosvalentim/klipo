@@ -237,6 +237,35 @@ button {
 	padding: 0.4rem 0.8rem;
 }
 
+.menu__control {
+	padding: 0.25rem;
+	border: 0;
+	border-radius: 0.25rem;
+	color: inherit;
+	background: transparent;
+	font-size: 0.75rem;
+	cursor: pointer;
+}
+
+.menu__control:hover {
+	background: rgba(255, 255, 255, 0.14);
+}
+
+.menu__control:focus-visible {
+	outline: 2px solid #0a84ff;
+	outline-offset: 2px;
+}
+
+.platform-linux .menu__control:hover {
+	background: #e2e8f0;
+}
+
+@media (prefers-color-scheme: dark) {
+	.platform-linux .menu__control:hover {
+		background: #475569;
+	}
+}
+
 .menu__content {
 	position: relative;
 	z-index: 1;

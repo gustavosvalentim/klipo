@@ -82,7 +82,6 @@ pub fn get_main_window(app: &tauri::AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(MAIN_WINDOW_LABEL)
 }
 
-#[cfg(target_os = "linux")]
 pub fn show_picker_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
     let window = get_main_window(app).ok_or(tauri::Error::WindowNotFound)?;
 

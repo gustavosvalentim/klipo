@@ -16,7 +16,7 @@ mod window;
 use clipboard::{ClipboardEventsListener, SystemClipboard};
 use commands::{
     clear, close, delete_item, fetch_clipboard, get_capabilities, get_shortcuts,
-    log_frontend_error, paste, quit, save_shortcuts,
+    log_frontend_error, paste, quit, save_shortcuts, show_settings,
 };
 use desktop::{CapabilityUnavailableReason, DesktopCapability, DesktopSession};
 use input::supports_input;
@@ -52,6 +52,7 @@ pub fn run() {
             paste,
             clear,
             quit,
+            show_settings,
             close,
             delete_item,
             get_shortcuts,
@@ -103,6 +104,8 @@ pub fn run() {
             if let Err(error_value) = cleanup_global_shortcuts(app_handle) {
                 error!(error:% = error_value; "Failed to release global shortcut resources during shutdown");
             }
+
+            tray::remove(app_handle);
         }
     });
 }
@@ -259,7 +262,14 @@ fn initialize_tray(
 
     let result = startup.run_capability(
         &[DesktopCapability::Tray],
-        || tray::create(app),
+        || {
+            tray::construct_and_retain(
+                || tray::create(app),
+                |tray_icon| {
+                    let _ = app.manage(tray::RetainedTrayIcon::new(tray_icon));
+                },
+            )
+        },
         |_| CapabilityUnavailableReason::InitializationFailed,
     );
 
