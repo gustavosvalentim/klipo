@@ -191,14 +191,6 @@ pub fn restore_focused_window(state: &AppState) -> Result<(), FocusError> {
     focus_target.restore()
 }
 
-pub fn is_klipo_focused() -> bool {
-    is_current_process(focused_process_id(), std::process::id())
-}
-
-fn is_current_process(focused_process_id: Option<i32>, current_process_id: u32) -> bool {
-    focused_process_id == i32::try_from(current_process_id).ok()
-}
-
 fn focused_process_id() -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
@@ -253,13 +245,6 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn recognizes_klipo_as_the_focused_process_without_exposing_its_identifier() {
-        assert!(is_current_process(Some(42), 42));
-        assert!(!is_current_process(Some(41), 42));
-        assert!(!is_current_process(None, 42));
-    }
 
     #[test]
     fn restores_the_opaque_target_only_inside_the_platform_boundary() {
