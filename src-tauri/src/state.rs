@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use clipboard_rs::WatcherShutdown;
+
 use crate::clipboard::SystemClipboard;
 use crate::desktop::{
     CapabilityStatus, CapabilityUnavailableReason, DesktopCapabilities, DesktopCapability,
@@ -38,6 +40,7 @@ pub struct AppState {
     pub input: InputState,
     pub(crate) focus_target: Mutex<FocusTarget>,
     pub shortcuts: Mutex<ShortcutSettings>,
+    clipboard_watcher_shutdown: Mutex<Option<WatcherShutdown>>,
     capabilities: Mutex<DesktopCapabilities>,
 }
 
@@ -59,6 +62,7 @@ impl AppState {
             input: InputState::new(),
             focus_target: Mutex::new(FocusTarget::empty()),
             shortcuts: Mutex::new(ShortcutSettings::default()),
+            clipboard_watcher_shutdown: Mutex::new(None),
             capabilities: Mutex::new(DesktopCapabilities::unavailable(
                 session,
                 unavailable_reason,
@@ -76,6 +80,22 @@ impl AppState {
             DesktopCapability::ClipboardWrite,
             CapabilityStatus::available(),
         );
+    }
+
+    pub fn install_clipboard_watcher(&self, watcher_shutdown: WatcherShutdown) {
+        if let Ok(mut current_shutdown) = self.clipboard_watcher_shutdown.lock() {
+            *current_shutdown = Some(watcher_shutdown);
+        }
+    }
+
+    pub fn shutdown_clipboard_watcher(&self) {
+        if let Ok(mut current_shutdown) = self.clipboard_watcher_shutdown.lock() {
+            drop(current_shutdown.take());
+        }
+
+        if let Some(system_clipboard) = self.system_clipboard.as_ref() {
+            system_clipboard.shutdown();
+        }
     }
 
     pub fn set_capability(&self, capability: DesktopCapability, status: CapabilityStatus) {

@@ -1,17 +1,22 @@
+use md5::{Digest, Md5};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use clipboard_rs::common::RustImage;
 use clipboard_rs::{
     Clipboard, ClipboardContent, ClipboardContext, ClipboardHandler, ClipboardWatcher,
-    ClipboardWatcherContext, ContentFormat, RustImageData,
+    ClipboardWatcherContext, ContentFormat, RustImageData, WatcherShutdown,
 };
 use log::{debug, error};
 use tauri::{Emitter, Manager};
 
 use crate::state::AppState;
-use crate::window::is_klipo_focused;
+
+const SELF_WRITE_MARKER_TTL: Duration = Duration::from_secs(2);
+const MAX_SELF_WRITE_MARKERS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {
@@ -104,6 +109,36 @@ impl ClipboardBackend for NativeClipboardBackend {
 
 pub struct SystemClipboard {
     context: std::sync::Mutex<Box<dyn ClipboardBackend>>,
+    self_write_markers: std::sync::Mutex<SelfWriteMarkers>,
+    clock: Box<dyn ClipboardClock>,
+}
+
+trait ClipboardClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+struct SystemClipboardClock;
+
+impl ClipboardClock for SystemClipboardClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardSignature([u8; 16]);
+
+#[derive(Debug)]
+struct SelfWriteMarker {
+    id: u64,
+    signature: ClipboardSignature,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct SelfWriteMarkers {
+    next_id: u64,
+    entries: VecDeque<SelfWriteMarker>,
 }
 
 impl SystemClipboard {
@@ -111,91 +146,329 @@ impl SystemClipboard {
         let context = ClipboardContext::new().map_err(|_| SystemClipboardError::Initialization)?;
         Ok(Self {
             context: std::sync::Mutex::new(Box::new(NativeClipboardBackend { context })),
+            self_write_markers: std::sync::Mutex::new(SelfWriteMarkers::default()),
+            clock: Box::new(SystemClipboardClock),
         })
     }
 
+    #[cfg(test)]
     pub fn read(&self) -> Result<ClipboardSnapshot, SystemClipboardError> {
-        let contents = {
-            let context = self
-                .context
-                .lock()
-                .map_err(|_| SystemClipboardError::LockPoisoned)?;
-            context.get(&[ContentFormat::Image, ContentFormat::Text])?
-        };
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        self.read_snapshot(context.as_ref())
+    }
 
+    fn read_and_reconcile_self_write(
+        &self,
+        on_snapshot_read: impl FnOnce(),
+    ) -> Result<(ClipboardSnapshot, bool), SystemClipboardError> {
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        let snapshot = self.read_snapshot(context.as_ref())?;
+        on_snapshot_read();
+        let is_self_write = self.reconcile_self_write(&snapshot);
+
+        Ok((snapshot, is_self_write))
+    }
+
+    fn read_snapshot(
+        &self,
+        context: &dyn ClipboardBackend,
+    ) -> Result<ClipboardSnapshot, SystemClipboardError> {
+        let contents = context.get(&[ContentFormat::Image, ContentFormat::Text])?;
         Ok(snapshot_from_contents(contents))
     }
 
     pub fn write_item(&self, item: &ClipboardItem) -> Result<(), SystemClipboardError> {
         let text = (!item.text.is_empty()).then_some(item.text.as_str());
 
+        let context = self
+            .context
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+
         match (item.image.as_ref(), text) {
-            (Some(image), Some(text)) => self.write_mixed(rust_image_from_clipboard(image), text),
-            (Some(image), None) => {
-                let image = rust_image_from_clipboard(image)?;
-                self.write_and_verify(vec![ClipboardContent::Image(image)], true, false)
+            (Some(image), Some(text)) => self.write_mixed(
+                context.as_ref(),
+                rust_image_from_clipboard(image),
+                text,
+                signature_for_content(Some(image), Some(text)),
+            ),
+            (Some(clipboard_image), None) => {
+                let signature = signature_for_content(Some(clipboard_image), None);
+                let image = rust_image_from_clipboard(clipboard_image)?;
+                self.write_and_verify(
+                    context.as_ref(),
+                    vec![ClipboardContent::Image(image)],
+                    true,
+                    false,
+                    signature,
+                )
             }
-            (None, Some(text)) => {
-                self.write_and_verify(vec![ClipboardContent::Text(text.to_owned())], false, true)
-            }
+            (None, Some(text)) => self.write_and_verify(
+                context.as_ref(),
+                vec![ClipboardContent::Text(text.to_owned())],
+                false,
+                true,
+                signature_for_content(None, Some(text)),
+            ),
             (None, None) => Err(SystemClipboardError::EmptyContent),
         }
     }
 
     fn write_mixed(
         &self,
+        context: &dyn ClipboardBackend,
         image: Result<RustImageData, SystemClipboardError>,
         text: &str,
+        mixed_signature: ClipboardSignature,
     ) -> Result<(), SystemClipboardError> {
-        let context = self
-            .context
-            .lock()
-            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        match image {
+            Ok(image) => {
+                let marker_id = self.arm_self_write(mixed_signature)?;
+                let mixed_result = write_and_verify(
+                    context,
+                    vec![
+                        ClipboardContent::Image(image),
+                        ClipboardContent::Text(text.to_owned()),
+                    ],
+                    true,
+                    true,
+                );
 
-        let mixed_result = match image {
-            Ok(image) => write_and_verify(
-                context.as_ref(),
-                vec![
-                    ClipboardContent::Image(image),
-                    ClipboardContent::Text(text.to_owned()),
-                ],
-                true,
-                true,
-            ),
-            Err(error) => Err(error),
-        };
+                if mixed_result.is_ok() {
+                    self.retain_self_write(marker_id, mixed_signature)?;
+                    Ok(())
+                } else {
+                    let fallback_signature = signature_for_content(None, Some(text));
+                    self.update_self_write(marker_id, fallback_signature)?;
+                    let fallback_result = write_and_verify(
+                        context,
+                        vec![ClipboardContent::Text(text.to_owned())],
+                        false,
+                        true,
+                    );
 
-        if mixed_result.is_ok() {
-            Ok(())
-        } else {
-            write_and_verify(
-                context.as_ref(),
+                    if fallback_result.is_ok() {
+                        self.retain_self_write(marker_id, fallback_signature)?;
+                    } else {
+                        self.clear_self_write(marker_id)?;
+                    }
+
+                    fallback_result
+                }
+            }
+            Err(_) => self.write_and_verify(
+                context,
                 vec![ClipboardContent::Text(text.to_owned())],
                 false,
                 true,
-            )
+                signature_for_content(None, Some(text)),
+            ),
         }
     }
 
     fn write_and_verify(
         &self,
+        context: &dyn ClipboardBackend,
         contents: Vec<ClipboardContent>,
         requires_image: bool,
         requires_text: bool,
+        signature: ClipboardSignature,
     ) -> Result<(), SystemClipboardError> {
-        let context = self
-            .context
+        let marker_id = self.arm_self_write(signature)?;
+        let write_result = write_and_verify(context, contents, requires_image, requires_text);
+
+        if write_result.is_ok() {
+            self.retain_self_write(marker_id, signature)?;
+        } else {
+            self.clear_self_write(marker_id)?;
+        }
+
+        write_result
+    }
+
+    fn arm_self_write(&self, signature: ClipboardSignature) -> Result<u64, SystemClipboardError> {
+        let now = self.clock.now();
+        let mut markers = self
+            .self_write_markers
             .lock()
             .map_err(|_| SystemClipboardError::LockPoisoned)?;
-        write_and_verify(context.as_ref(), contents, requires_image, requires_text)
+        markers.entries.retain(|marker| marker.expires_at > now);
+
+        while markers.entries.len() >= MAX_SELF_WRITE_MARKERS {
+            markers.entries.pop_front();
+        }
+
+        markers.next_id = markers.next_id.wrapping_add(1);
+        let marker_id = markers.next_id;
+        markers.entries.push_back(SelfWriteMarker {
+            id: marker_id,
+            signature,
+            expires_at: now + SELF_WRITE_MARKER_TTL,
+        });
+
+        Ok(marker_id)
+    }
+
+    fn retain_self_write(
+        &self,
+        marker_id: u64,
+        signature: ClipboardSignature,
+    ) -> Result<(), SystemClipboardError> {
+        let now = self.clock.now();
+        let mut markers = self
+            .self_write_markers
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        markers.entries.retain(|marker| marker.expires_at > now);
+
+        if let Some(marker) = markers
+            .entries
+            .iter_mut()
+            .find(|marker| marker.id == marker_id)
+        {
+            marker.signature = signature;
+            marker.expires_at = now + SELF_WRITE_MARKER_TTL;
+        }
+
+        Ok(())
+    }
+
+    fn update_self_write(
+        &self,
+        marker_id: u64,
+        signature: ClipboardSignature,
+    ) -> Result<(), SystemClipboardError> {
+        let now = self.clock.now();
+        let mut markers = self
+            .self_write_markers
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        markers.entries.retain(|marker| marker.expires_at > now);
+
+        if let Some(marker) = markers
+            .entries
+            .iter_mut()
+            .find(|marker| marker.id == marker_id)
+        {
+            marker.signature = signature;
+            marker.expires_at = now + SELF_WRITE_MARKER_TTL;
+        }
+
+        Ok(())
+    }
+
+    fn clear_self_write(&self, marker_id: u64) -> Result<(), SystemClipboardError> {
+        let mut markers = self
+            .self_write_markers
+            .lock()
+            .map_err(|_| SystemClipboardError::LockPoisoned)?;
+        markers.entries.retain(|marker| marker.id != marker_id);
+        Ok(())
+    }
+
+    fn reconcile_self_write(&self, snapshot: &ClipboardSnapshot) -> bool {
+        let now = self.clock.now();
+        let snapshot_signature = signature_for_snapshot(snapshot);
+        let markers = self.self_write_markers.lock();
+
+        let Ok(mut markers) = markers else {
+            return false;
+        };
+        markers.entries.retain(|marker| marker.expires_at > now);
+
+        let matching_marker = snapshot_signature.and_then(|signature| {
+            markers
+                .entries
+                .iter()
+                .rposition(|marker| marker.signature == signature)
+        });
+
+        match matching_marker {
+            Some(index) => {
+                markers.entries.drain(..=index);
+                true
+            }
+            None => {
+                markers.entries.clear();
+                false
+            }
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        if let Ok(mut markers) = self.self_write_markers.lock() {
+            markers.entries.clear();
+        }
     }
 
     #[cfg(test)]
     fn from_backend(backend: impl ClipboardBackend + 'static) -> Self {
         Self {
             context: std::sync::Mutex::new(Box::new(backend)),
+            self_write_markers: std::sync::Mutex::new(SelfWriteMarkers::default()),
+            clock: Box::new(SystemClipboardClock),
         }
     }
+
+    #[cfg(test)]
+    fn from_backend_with_clock(
+        backend: impl ClipboardBackend + 'static,
+        clock: impl ClipboardClock + 'static,
+    ) -> Self {
+        Self {
+            context: std::sync::Mutex::new(Box::new(backend)),
+            self_write_markers: std::sync::Mutex::new(SelfWriteMarkers::default()),
+            clock: Box::new(clock),
+        }
+    }
+}
+
+fn signature_for_snapshot(snapshot: &ClipboardSnapshot) -> Option<ClipboardSignature> {
+    match (snapshot.image.as_ref(), snapshot.text.as_deref()) {
+        (None, None) => None,
+        (image, text) => Some(signature_for_content(image, text)),
+    }
+}
+
+fn signature_for_content(image: Option<&ClipboardImage>, text: Option<&str>) -> ClipboardSignature {
+    let mut hasher = Md5::new();
+    hasher.update(b"klipo-self-write:v1\0");
+
+    match (image, text) {
+        (Some(image), Some(text)) => {
+            hasher.update(b"image+text\0");
+            update_image_signature(&mut hasher, image);
+            update_bytes_signature(&mut hasher, text.as_bytes());
+        }
+        (Some(image), None) => {
+            hasher.update(b"image\0");
+            update_image_signature(&mut hasher, image);
+        }
+        (None, Some(text)) => {
+            hasher.update(b"text\0");
+            update_bytes_signature(&mut hasher, text.as_bytes());
+        }
+        (None, None) => unreachable!("clipboard writes must contain text or an image"),
+    }
+
+    ClipboardSignature(hasher.finalize().into())
+}
+
+fn update_image_signature(hasher: &mut Md5, image: &ClipboardImage) {
+    hasher.update(image.width.to_le_bytes());
+    hasher.update(image.height.to_le_bytes());
+    update_bytes_signature(hasher, &image.rgba);
+}
+
+fn update_bytes_signature(hasher: &mut Md5, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 fn snapshot_from_contents(contents: Vec<ClipboardContent>) -> ClipboardSnapshot {
@@ -272,10 +545,15 @@ fn capture_clipboard_change(
     system_clipboard: &SystemClipboard,
     store: &crate::storage::ClipboardStore,
 ) -> Result<bool, ClipboardCaptureError> {
-    let snapshot = system_clipboard
-        .read()
+    let (snapshot, is_self_write) = system_clipboard
+        .read_and_reconcile_self_write(|| {})
         .map_err(ClipboardCaptureError::Read)?;
-    store_snapshot(store, snapshot).map_err(ClipboardCaptureError::Store)
+
+    if is_self_write {
+        Ok(false)
+    } else {
+        store_snapshot(store, snapshot).map_err(ClipboardCaptureError::Store)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,11 +584,13 @@ pub struct ClipboardEventsListener {
 impl ClipboardEventsListener {
     pub fn new(
         app_handler: tauri::AppHandle,
-    ) -> Result<ClipboardEventsListener, ClipboardWatcherInitializationError> {
+    ) -> Result<(ClipboardEventsListener, WatcherShutdown), ClipboardWatcherInitializationError>
+    {
         let mut watcher =
             ClipboardWatcherContext::new().map_err(|_| ClipboardWatcherInitializationError)?;
         watcher.add_handler(ClipboardEventsHandler::new(Arc::new(app_handler)));
-        Ok(Self { watcher })
+        let shutdown = watcher.get_shutdown_channel();
+        Ok((Self { watcher }, shutdown))
     }
 
     pub fn start(mut self) {
@@ -331,10 +611,6 @@ impl ClipboardEventsHandler {
 impl ClipboardHandler for ClipboardEventsHandler {
     fn on_clipboard_change(&mut self) {
         debug!("Clipboard changed");
-
-        if is_klipo_focused() {
-            return;
-        }
 
         let state = self.app.state::<AppState>();
         let Some(system_clipboard) = state.system_clipboard.as_ref() else {
@@ -413,13 +689,15 @@ impl ClipboardEventsEmitter for tauri::AppHandle {
 mod tests {
     use super::{
         capture_clipboard_change, store_snapshot, ClipboardBackend, ClipboardCaptureError,
-        ClipboardContent, ClipboardImage, ClipboardItem, ClipboardSnapshot, ContentFormat,
-        RustImage, RustImageData, SystemClipboard, SystemClipboardError,
+        ClipboardClock, ClipboardContent, ClipboardImage, ClipboardItem, ClipboardSnapshot,
+        ContentFormat, RustImage, RustImageData, SystemClipboard, SystemClipboardError,
+        SELF_WRITE_MARKER_TTL,
     };
     use crate::storage::ClipboardStore;
     use image::{DynamicImage, RgbaImage};
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::time::{Duration, Instant};
 
     #[derive(Debug, PartialEq)]
     enum FakeWriteContent {
@@ -449,6 +727,30 @@ mod tests {
         observations: Arc<Mutex<FakeClipboardObservations>>,
         set_results: Mutex<VecDeque<Result<(), SystemClipboardError>>>,
         has_results: Mutex<VecDeque<bool>>,
+    }
+
+    #[derive(Clone)]
+    struct TestClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl TestClock {
+        fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
+    impl ClipboardClock for TestClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
     }
 
     impl FakeClipboard {
@@ -668,6 +970,265 @@ mod tests {
         ));
         assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
         assert_eq!(store.first().unwrap().text, "recovered");
+    }
+
+    #[test]
+    fn verified_klipo_text_write_is_not_captured_again() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Text("hello".into())])],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("hello", None)).unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_klipo_image_write_is_not_captured_again() {
+        let image = clipboard_image(vec![1, 2, 3, 4], 1, 1);
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Image(rust_image(
+                image.rgba.clone(),
+                image.width,
+                image.height,
+            ))])],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("", Some(image))).unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verified_klipo_mixed_write_is_not_captured_again() {
+        let image = clipboard_image(vec![1, 2, 3, 4], 1, 1);
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![
+                ClipboardContent::Image(rust_image(image.rgba.clone(), image.width, image.height)),
+                ClipboardContent::Text("fallback".into()),
+            ])],
+            Vec::new(),
+            vec![true, true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard
+            .write_item(&item("fallback", Some(image)))
+            .unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixed_write_fallback_updates_the_self_write_marker_to_text() {
+        let image = clipboard_image(vec![1, 2, 3, 4], 1, 1);
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Text("fallback".into())])],
+            vec![Ok(()), Ok(())],
+            vec![true, false, true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard
+            .write_item(&item("fallback", Some(image)))
+            .unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn later_identical_external_copy_is_captured_after_self_write_marker_is_consumed() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![
+                Ok(vec![ClipboardContent::Text("hello".into())]),
+                Ok(vec![ClipboardContent::Text("hello".into())]),
+            ],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("hello", None)).unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn external_copy_of_a_superseded_write_is_captured_after_coalesced_changes() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![
+                Ok(vec![ClipboardContent::Text("B".into())]),
+                Ok(vec![ClipboardContent::Text("A".into())]),
+            ],
+            Vec::new(),
+            vec![true, true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("A", None)).unwrap();
+        system_clipboard.write_item(&item("B", None)).unwrap();
+
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "A");
+    }
+
+    #[test]
+    fn concurrent_write_cannot_lose_its_self_write_marker_to_an_earlier_capture() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![
+                Ok(vec![ClipboardContent::Text("external".into())]),
+                Ok(vec![ClipboardContent::Text("klipo".into())]),
+            ],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = Arc::new(SystemClipboard::from_backend(backend));
+        let snapshot_read = Arc::new(Barrier::new(2));
+        let writer_started = Arc::new(Barrier::new(2));
+
+        let writer_clipboard = Arc::clone(&system_clipboard);
+        let writer_snapshot_read = Arc::clone(&snapshot_read);
+        let writer_started_signal = Arc::clone(&writer_started);
+        let writer = std::thread::spawn(move || {
+            writer_snapshot_read.wait();
+            writer_started_signal.wait();
+            writer_clipboard.write_item(&item("klipo", None))
+        });
+
+        let capture_clipboard = Arc::clone(&system_clipboard);
+        let capture_snapshot_read = Arc::clone(&snapshot_read);
+        let capture_writer_started = Arc::clone(&writer_started);
+        let capture = std::thread::spawn(move || {
+            capture_clipboard.read_and_reconcile_self_write(|| {
+                capture_snapshot_read.wait();
+                capture_writer_started.wait();
+            })
+        });
+
+        let (snapshot, is_self_write) = capture.join().unwrap().unwrap();
+        writer.join().unwrap().unwrap();
+        let store = ClipboardStore::new();
+
+        assert!(!is_self_write);
+        assert!(store_snapshot(&store, snapshot).unwrap());
+        assert!(!capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expired_self_write_marker_does_not_suppress_matching_external_copy() {
+        let clock = TestClock::new();
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Text("hello".into())])],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend_with_clock(backend, clock.clone());
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("hello", None)).unwrap();
+        clock.advance(SELF_WRITE_MARKER_TTL);
+
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn mismatched_capture_is_stored_and_clears_the_stale_self_write_marker() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![
+                Ok(vec![ClipboardContent::Text("external".into())]),
+                Ok(vec![ClipboardContent::Text("hello".into())]),
+            ],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("hello", None)).unwrap();
+
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_write_clears_its_self_write_marker() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Text("hello".into())])],
+            vec![Err(SystemClipboardError::Write)],
+            Vec::new(),
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        assert!(matches!(
+            system_clipboard.write_item(&item("hello", None)),
+            Err(SystemClipboardError::Write)
+        ));
+
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn shutdown_clears_pending_self_write_markers() {
+        let (backend, _) = FakeClipboard::with_write_behavior(
+            vec![Ok(vec![ClipboardContent::Text("hello".into())])],
+            Vec::new(),
+            vec![true],
+        );
+        let system_clipboard = SystemClipboard::from_backend(backend);
+        let store = ClipboardStore::new();
+
+        system_clipboard.write_item(&item("hello", None)).unwrap();
+        system_clipboard.shutdown();
+
+        assert!(capture_clipboard_change(&system_clipboard, &store).unwrap());
+        assert_eq!(store.first().unwrap().text, "hello");
+    }
+
+    #[test]
+    fn pending_self_write_markers_are_bounded() {
+        let (backend, _) =
+            FakeClipboard::with_write_behavior(Vec::new(), Vec::new(), vec![true; 9]);
+        let system_clipboard = SystemClipboard::from_backend(backend);
+
+        for index in 0..9 {
+            system_clipboard
+                .write_item(&item(&format!("text-{index}"), None))
+                .unwrap();
+        }
+
+        assert_eq!(
+            system_clipboard
+                .self_write_markers
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            super::MAX_SELF_WRITE_MARKERS
+        );
     }
 
     fn item(text: &str, image: Option<ClipboardImage>) -> ClipboardItem {
