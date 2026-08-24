@@ -135,15 +135,20 @@ fn global_shortcut_bindings(
 }
 
 fn show_on_cursor_handler(app: &tauri::AppHandle) {
-    let state = app.state::<AppState>();
-    if let Err(error_value) = capture_focused_window(&state) {
-        error!(error:debug = error_value; "Failed to get and store window state");
-    }
-
     let Some(window) = get_main_window(app) else {
         error!("Failed to get main window");
         return;
     };
+
+    let picker_is_focused = window.is_focused();
+    if should_capture_focus_target(&picker_is_focused) {
+        let state = app.state::<AppState>();
+        if let Err(error_value) = capture_focused_window(&state) {
+            error!(error:debug = error_value; "Failed to get and store window state");
+        }
+    } else if let Err(error_value) = picker_is_focused {
+        error!(error:debug = error_value; "Failed to determine whether the picker is focused");
+    }
 
     #[cfg(target_os = "linux")]
     let window_position = Position::Physical(get_linux_picker_position(app, &window));
@@ -173,6 +178,10 @@ fn show_on_cursor_handler(app: &tauri::AppHandle) {
             error!(error:debug = error_value; "Failed to focus window");
         }
     });
+}
+
+fn should_capture_focus_target<FocusError>(picker_is_focused: &Result<bool, FocusError>) -> bool {
+    matches!(picker_is_focused, Ok(false))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -704,6 +713,13 @@ mod tests {
     use super::*;
 
     const PICKER_SIZE: (u32, u32) = (250, 350);
+
+    #[test]
+    fn repeated_shortcut_preserves_the_target_while_the_picker_is_focused() {
+        assert!(should_capture_focus_target(&Ok::<bool, ()>(false)));
+        assert!(!should_capture_focus_target(&Ok::<bool, ()>(true)));
+        assert!(!should_capture_focus_target(&Err::<bool, ()>(())));
+    }
 
     fn monitor(
         x: i32,
