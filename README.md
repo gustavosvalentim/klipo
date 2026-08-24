@@ -13,6 +13,18 @@ Klipo is a macOS clipboard manager built with Tauri, React, TypeScript, and Rust
 
 Klipo currently supports macOS only. Linux and Windows support are not implemented.
 
+### X11 clipboard ownership
+
+When Klipo runs in an X11 session, `clipboard-rs` owns the X11 clipboard selection for as long
+as the Klipo process remains alive. Klipo verifies every write before attempting a paste, including
+text, images, and mixed content (with a text-only fallback when the desktop rejects mixed data).
+X11 selection ownership is process-lifetime: if Klipo exits, its copied content is no longer
+available unless an external clipboard manager has persisted it. Automatic paste remains disabled
+on Wayland and when the X11 target-restoration adapter cannot be probed.
+
+The X11 implementation has protocol-level unit tests, but native acceptance on Ubuntu 22.04 and
+24.04 has not been run from this Darwin ARM64 development host.
+
 ## Install
 
 > [!WARNING]

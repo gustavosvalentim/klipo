@@ -337,7 +337,26 @@ fn set_target_restoration_capability(startup: &mut StartupCoordinator, session: 
         );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let restoration_supported =
+            session == DesktopSession::X11 && window::supports_target_restoration();
+        let result = startup.run_capability(
+            &[DesktopCapability::TargetRestoration],
+            || target_restoration_result(session, restoration_supported),
+            |reason| *reason,
+        );
+        if let Err(error_value) = result {
+            log_startup_failure(
+                session,
+                DesktopCapability::TargetRestoration,
+                error_value,
+                &"target restoration is unavailable for this desktop session",
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let reason = target_restoration_unavailable_reason(session);
         let result = startup.run_capability(
@@ -374,6 +393,20 @@ fn target_restoration_unavailable_reason(session: DesktopSession) -> CapabilityU
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn target_restoration_result(
+    session: DesktopSession,
+    restoration_supported: bool,
+) -> Result<(), CapabilityUnavailableReason> {
+    if session != DesktopSession::X11 {
+        Err(target_restoration_unavailable_reason(session))
+    } else if restoration_supported {
+        Ok(())
+    } else {
+        Err(CapabilityUnavailableReason::AdapterUnavailable)
+    }
+}
+
 fn log_startup_failure(
     session: DesktopSession,
     capability: DesktopCapability,
@@ -407,6 +440,19 @@ mod tests {
         assert_eq!(
             target_restoration_unavailable_reason(DesktopSession::Unknown),
             CapabilityUnavailableReason::UnknownSession
+        );
+    }
+
+    #[test]
+    fn enables_target_restoration_only_for_a_probed_x11_adapter() {
+        assert_eq!(target_restoration_result(DesktopSession::X11, true), Ok(()));
+        assert_eq!(
+            target_restoration_result(DesktopSession::X11, false),
+            Err(CapabilityUnavailableReason::AdapterUnavailable)
+        );
+        assert_eq!(
+            target_restoration_result(DesktopSession::Wayland, true),
+            Err(CapabilityUnavailableReason::UnsupportedSession)
         );
     }
 }
