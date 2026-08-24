@@ -31,7 +31,10 @@ impl PickerActivation {
     pub fn flush<E>(&self, show_picker: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         self.ready.store(true, Ordering::SeqCst);
 
-        let generation = self.requested_generation.load(Ordering::SeqCst);
+        let generation = self
+            .requested_generation
+            .fetch_max(1, Ordering::SeqCst)
+            .max(1);
 
         self.deliver(generation, show_picker)
     }
@@ -206,7 +209,7 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc, Barrier,
@@ -245,6 +248,76 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(stages.into_inner(), ["resources", "picker"]);
+    }
+
+    #[test]
+    fn primary_launch_shows_the_picker_without_a_second_instance() {
+        let picker_activation = PickerActivation::default();
+        let stages = RefCell::new(Vec::new());
+
+        let result = run_primary_setup(
+            &picker_activation,
+            || {
+                stages.borrow_mut().push("resources");
+                Ok::<_, ()>(())
+            },
+            || {
+                stages.borrow_mut().push("picker");
+                Ok::<_, ()>(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(stages.into_inner(), ["resources", "picker"]);
+        assert_eq!(
+            picker_activation
+                .requested_generation
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            picker_activation
+                .delivered_generation
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_launch_shows_the_picker_again_after_primary_startup() {
+        let picker_activation = PickerActivation::default();
+        let picker_shows = Cell::new(0);
+
+        let result = run_primary_setup(
+            &picker_activation,
+            || Ok::<_, ()>(()),
+            || {
+                picker_shows.set(picker_shows.get() + 1);
+                Ok::<_, ()>(())
+            },
+            |_| {},
+        );
+        let activation = picker_activation.activate_existing_instance(|| {
+            picker_shows.set(picker_shows.get() + 1);
+            Ok::<_, ()>(())
+        });
+
+        assert!(result.is_ok());
+        assert!(activation.is_ok());
+        assert_eq!(picker_shows.get(), 2);
+        assert_eq!(
+            picker_activation
+                .requested_generation
+                .load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            picker_activation
+                .delivered_generation
+                .load(Ordering::SeqCst),
+            2
+        );
     }
 
     #[test]

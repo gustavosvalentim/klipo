@@ -8,7 +8,7 @@ use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem, SystemClipboard};
 use crate::desktop::{DesktopCapabilities, DesktopCapability};
 use crate::input::simulate_paste_input;
 use crate::state::AppState;
-use crate::window::{get_main_window, restore_focused_window};
+use crate::window::{get_main_window, restore_focused_window, show_settings_window};
 use crate::{settings::ShortcutSettings, shortcuts};
 
 #[tauri::command]
@@ -240,13 +240,17 @@ pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) -> PasteOut
 
 #[tauri::command]
 pub fn quit(app: AppHandle) {
-    let Some(window) = get_main_window(&app) else {
-        error!("Failed to get main window");
-        return;
-    };
+    exit_application(&app);
+}
 
-    if let Err(error_value) = window.close() {
-        error!(error:debug = error_value; "Failed to close window");
+pub(crate) fn exit_application(app: &AppHandle) {
+    app.exit(0);
+}
+
+#[tauri::command]
+pub fn show_settings(app: AppHandle) {
+    if let Err(error_value) = show_settings_window(&app) {
+        error!(error:debug = error_value; "Failed to show settings");
     }
 }
 
