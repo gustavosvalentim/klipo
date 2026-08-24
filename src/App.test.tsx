@@ -61,8 +61,18 @@ function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function activateWithEnter(button: HTMLElement) {
+	const defaultWasAllowed = fireEvent.keyDown(button, {
+		code: "Enter",
+		key: "Enter",
+	});
+
+	if (defaultWasAllowed) fireEvent.click(button);
+}
+
 describe("App", () => {
 	beforeEach(() => {
+		HTMLElement.prototype.scrollIntoView = vi.fn();
 		mocks.currentWindow.isVisible.mockResolvedValue(true);
 		mocks.currentWindow.show.mockResolvedValue(undefined);
 		mocks.currentWindow.setFocus.mockResolvedValue(undefined);
@@ -181,5 +191,45 @@ describe("App", () => {
 		expect(screen.queryByRole("status")).toBeNull();
 		expect(mocks.currentWindow.show).not.toHaveBeenCalled();
 		expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
+	});
+
+	it("activates settings and quit controls with Enter without a tray", async () => {
+		await renderPicker();
+
+		const settings = screen.getByRole("button", { name: "Settings" });
+		const quit = screen.getByRole("button", { name: "Quit" });
+
+		settings.focus();
+		expect(document.activeElement).toBe(settings);
+		activateWithEnter(settings);
+		activateWithEnter(quit);
+
+		expect(mocks.invoke).toHaveBeenCalledWith("show_settings");
+		expect(mocks.invoke).toHaveBeenCalledWith("quit");
+	});
+
+	it("closes the picker when Escape is pressed from a focused control", async () => {
+		await renderPicker();
+
+		const settings = screen.getByRole("button", { name: "Settings" });
+		settings.focus();
+		fireEvent.keyDown(settings, { code: "Escape", key: "Escape" });
+
+		await waitFor(() => {
+			expect(mocks.invoke).toHaveBeenCalledWith("close");
+		});
+	});
+
+	it("keeps picker shortcuts active outside interactive controls", async () => {
+		await renderPicker();
+
+		fireEvent.keyDown(window, { code: "ArrowDown", key: "ArrowDown" });
+		fireEvent.keyDown(window, { code: "Enter", key: "Enter" });
+
+		await waitFor(() => {
+			expect(mocks.invoke).toHaveBeenCalledWith("paste", {
+				hash: "text:known",
+			});
+		});
 	});
 });

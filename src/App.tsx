@@ -54,6 +54,15 @@ function shortcutFromEvent(event: KeyboardEvent) {
 	return [...modifiers, event.code].join("+");
 }
 
+function isInteractiveTarget(target: EventTarget | null) {
+	return (
+		target instanceof Element &&
+		target.closest(
+			"button, input, select, textarea, [contenteditable='true'], [role='button']",
+		) !== null
+	);
+}
+
 const MenuSeparator = () => (
 	<div className="menu__separator h-px my-[4px] mx-0 bg-[rgba(235,235,245,0.18)]" />
 );
@@ -116,6 +125,18 @@ export function App() {
 			logError("Failed to clear clipboard history", error);
 		}
 	}, [invalidatePasteRequest]);
+
+	const showSettings = useCallback(() => {
+		void invoke("show_settings").catch((error) =>
+			logError("Failed to show settings", error),
+		);
+	}, []);
+
+	const quitApplication = useCallback(() => {
+		void invoke("quit").catch((error) =>
+			logError("Failed to quit Klipo", error),
+		);
+	}, []);
 
 	const pasteFromSelection = useCallback(
 		async (hash: string) => {
@@ -197,6 +218,9 @@ export function App() {
 				hide();
 				return;
 			}
+
+			if (isInteractiveTarget(event.target)) return;
+
 			if (!shortcuts) return;
 			const isValidItem = (itemIdx: number) =>
 				itemIdx >= 0 && itemIdx < clipboard.length;
@@ -313,7 +337,21 @@ export function App() {
 						<span className="text-base font-bold">Klipo</span>
 					</div>
 
-					<div className="flex justify-right items-center">
+					<div className="flex items-center gap-1">
+						<button
+							type="button"
+							className="menu__control"
+							onClick={showSettings}
+						>
+							Settings
+						</button>
+						<button
+							type="button"
+							className="menu__control"
+							onClick={quitApplication}
+						>
+							Quit
+						</button>
 						<ClearHistoryButton onClick={clearHistory} />
 					</div>
 				</div>
