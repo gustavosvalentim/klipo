@@ -333,7 +333,11 @@ export function App() {
 					</div>
 				)}
 
-				<div ref={historyRef} className="menu__history">
+				<div
+					ref={historyRef}
+					className={`menu__history${selectedItem === null ? "" : " has-keyboard-selection"}`}
+					onPointerMove={() => setSelectedItem(null)}
+				>
 					{clipboardMenuItems.map((item, idx) => (
 						<ListItem {...item} key={item.key} active={idx === selectedItem} />
 					))}
