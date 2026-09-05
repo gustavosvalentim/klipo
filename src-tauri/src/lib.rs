@@ -100,6 +100,9 @@ pub fn run() {
 
     application.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+            if let Some(app_state) = app_handle.try_state::<AppState>() {
+                app_state.shutdown_clipboard_watcher();
+            }
             if let Err(error_value) = cleanup_global_shortcuts(app_handle) {
                 error!(error:% = error_value; "Failed to release global shortcut resources during shutdown");
             }
@@ -306,7 +309,10 @@ fn initialize_clipboard_watcher(
                 .system_clipboard
                 .as_ref()
                 .ok_or_else(|| "system clipboard initialization failed".to_owned())?;
-            ClipboardEventsListener::new(app.clone()).map_err(|error| error.to_string())
+            let (listener, watcher_shutdown) =
+                ClipboardEventsListener::new(app.clone()).map_err(|error| error.to_string())?;
+            state.install_clipboard_watcher(watcher_shutdown);
+            Ok::<_, String>(listener)
         },
         |_| CapabilityUnavailableReason::InitializationFailed,
     );
