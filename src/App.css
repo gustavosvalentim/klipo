@@ -136,12 +136,14 @@ button {
 	background: rgba(30, 41, 59, 0.18);
 }
 
-.list-item__button:hover,
+.menu__history:not(.has-keyboard-selection) .list-item__button:hover,
 .list-item__button.is-active {
 	background: #0a84ff;
 }
 
-.platform-linux .list-item__button:hover,
+.platform-linux
+	.menu__history:not(.has-keyboard-selection)
+	.list-item__button:hover,
 .platform-linux .list-item__button.is-active {
 	color: #ffffff;
 	background: #075985;
@@ -193,7 +195,9 @@ button {
 		background: rgba(248, 250, 252, 0.18);
 	}
 
-	.platform-linux .list-item__button:hover,
+	.platform-linux
+		.menu__history:not(.has-keyboard-selection)
+		.list-item__button:hover,
 	.platform-linux .list-item__button.is-active {
 		color: #ffffff;
 		background: #075985;

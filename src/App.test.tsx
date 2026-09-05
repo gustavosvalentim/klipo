@@ -182,4 +182,21 @@ describe("App", () => {
 		expect(mocks.currentWindow.show).not.toHaveBeenCalled();
 		expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
 	});
+
+	it("shows hover or keyboard selection, but not both", async () => {
+		const item = await renderPicker();
+		const history = item.closest(".menu__history");
+		const row = item.parentElement as HTMLElement;
+		row.scrollIntoView = vi.fn();
+
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+
+		expect(item.className).toContain("is-active");
+		expect(history?.className).toContain("has-keyboard-selection");
+
+		fireEvent.pointerMove(history as Element);
+
+		expect(item.className).not.toContain("is-active");
+		expect(history?.className).not.toContain("has-keyboard-selection");
+	});
 });
