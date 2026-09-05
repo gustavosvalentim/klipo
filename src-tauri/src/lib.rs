@@ -100,9 +100,9 @@ pub fn run() {
 
     application.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            app_handle
-                .state::<AppState>()
-                .shutdown_clipboard_watcher();
+            if let Some(app_state) = app_handle.try_state::<AppState>() {
+                app_state.shutdown_clipboard_watcher();
+            }
             if let Err(error_value) = cleanup_global_shortcuts(app_handle) {
                 error!(error:% = error_value; "Failed to release global shortcut resources during shutdown");
             }
