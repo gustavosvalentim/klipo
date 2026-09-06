@@ -56,6 +56,9 @@ jobs:
       - name: Build the Tauri app
         run: bun run tauri build
 
+      - name: Verify the application bundle signature
+        run: codesign --verify --deep --strict --verbose=2 src-tauri/target/release/bundle/macos/Klipo.app
+
       - name: Create tag, GitHub release, and upload DMG
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,5 +80,5 @@ jobs:
             --title "$RELEASE_TAG" \
             --notes "## macOS installation notice
 
-          The attached DMG is unsigned and not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance." \
+          The attached app has an ad-hoc signature and is not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance." \
             --generate-notes
