@@ -16,7 +16,7 @@ Klipo currently supports macOS only. Linux and Windows support are not implement
 ## Install
 
 > [!WARNING]
-> Klipo's macOS DMG is unsigned and not notarized. Download it only from the official [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
+> Klipo's macOS app has an ad-hoc signature and is not notarized. Download it only from the official [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
 
 1. Download the latest `.dmg` from the [GitHub Releases page](https://github.com/gustavosvalentim/klipo/releases).
 2. Move Klipo to the Applications folder.
