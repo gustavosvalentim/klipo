@@ -1,9 +1,12 @@
 name: Release macOS app
 
 on:
-  push:
-    tags:
-      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example, v0.3.1)
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,32 +17,23 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - name: Check out the tagged revision
+      - name: Check out main
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Verify the tag was created from main
-        id: main
-        shell: bash
-        run: |
-          git fetch origin main
-          tag_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
-
-          if git merge-base --is-ancestor "$tag_commit" origin/main; then
-            echo "on_main=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "on_main=false" >> "$GITHUB_OUTPUT"
-            echo "The ${GITHUB_REF_NAME} tag does not point to a commit on main. No release will be created."
-          fi
-
-      - name: Set application version from tag
-        if: steps.main.outputs.on_main == 'true'
+      - name: Validate tag and set application version
         env:
-          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         shell: bash
         run: |
-          release_version="${RELEASE_VERSION#v}"
+          release_version="${RELEASE_TAG#v}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" > /dev/null 2>&1; then
+            echo "The ${RELEASE_TAG} tag already exists."
+            exit 1
+          fi
 
           if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release version: ${release_version}"
@@ -54,21 +48,18 @@ jobs:
           echo "Building Klipo ${release_version}"
 
       - name: Set up Bun
-        if: steps.main.outputs.on_main == 'true'
         uses: oven-sh/setup-bun@v2
 
       - name: Install dependencies
-        if: steps.main.outputs.on_main == 'true'
         run: bun install --frozen-lockfile
 
       - name: Build the Tauri app
-        if: steps.main.outputs.on_main == 'true'
         run: bun run tauri build
 
-      - name: Create GitHub release and upload DMG
-        if: steps.main.outputs.on_main == 'true'
+      - name: Create tag, GitHub release, and upload DMG
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -79,8 +70,11 @@ jobs:
             exit 1
           fi
 
-          gh release create "$GITHUB_REF_NAME" "${dmg_files[@]}" \
-            --title "$GITHUB_REF_NAME" \
+          release_commit="$(git rev-parse HEAD)"
+
+          gh release create "$RELEASE_TAG" "${dmg_files[@]}" \
+            --target "$release_commit" \
+            --title "$RELEASE_TAG" \
             --notes "## macOS installation notice
 
           The attached DMG is unsigned and not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance." \
