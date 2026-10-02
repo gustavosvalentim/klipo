@@ -131,7 +131,8 @@ pub mod test_support {
         record("setup");
 
         let database_path = trace_path.with_extension("sqlite3");
-        AppState::new(database_path, crate::desktop::detect_session())?;
+        let app_state = AppState::new(database_path, crate::desktop::detect_session())?;
+        app.manage(app_state);
         record("resource");
         crate::window::create_picker_window(&app.handle())
             .map_err(|error_value| std::io::Error::other(error_value.to_string()))?;
