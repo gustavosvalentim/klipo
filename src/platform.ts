@@ -1,5 +1,7 @@
 type PlatformName = "linux" | "macos";
 
+import type { DesktopCapabilities } from "./capabilities";
+
 type PlatformPresentation = {
 	className: `platform-${PlatformName}`;
 	shortcutLabels: Record<string, string>;
@@ -48,6 +50,13 @@ export function getPlatformPresentation(
 		: "linux";
 
 	return platformPresentations[platformName];
+}
+
+export function presentationForSession(
+	session: DesktopCapabilities["session"] | undefined,
+): PlatformPresentation {
+	if (!session) return getPlatformPresentation();
+	return platformPresentations[session === "macos" ? "macos" : "linux"];
 }
 
 function shortcutKeyLabel(key: string, shortcutLabels: Record<string, string>) {

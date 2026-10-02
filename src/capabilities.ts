@@ -9,7 +9,7 @@ export type CapabilityStatus =
 	| { status: "unavailable"; reason: CapabilityUnavailableReason };
 
 export type DesktopCapabilities = {
-	session: "x11" | "wayland" | "unknown";
+	session: "macos" | "x11" | "wayland" | "unknown";
 	clipboardRead: CapabilityStatus;
 	clipboardWrite: CapabilityStatus;
 	watcher: CapabilityStatus;

@@ -117,8 +117,10 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("klipo-shortcut-restart-{}", std::process::id()));
         let path = directory.join("shortcuts.json");
-        let mut settings = ShortcutSettings::default();
-        settings.open_klipo = "SUPER+ALT+KeyK".into();
+        let settings = ShortcutSettings {
+            open_klipo: "SUPER+ALT+KeyK".into(),
+            ..ShortcutSettings::default()
+        };
 
         save(&path, &settings).unwrap();
 

@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::vec::Vec;
 
-use crate::clipboard::{generate_preview, ClipboardImage, ClipboardItem};
+#[cfg(test)]
+use crate::content::ClipboardItem;
+use crate::content::{generate_preview, ClipboardImage, HistorySummary, PasteContent};
 
 const MAX_ITEMS: usize = 120;
 const RECONCILIATION_BATCH_SIZE: usize = 32;
@@ -20,6 +22,7 @@ pub enum ClipboardError {
     Io(io::Error),
     PoisonError,
     ItemNotFound,
+    ImageUnavailable { fallback_text: Option<String> },
 }
 
 impl std::fmt::Display for ClipboardError {
@@ -29,6 +32,7 @@ impl std::fmt::Display for ClipboardError {
             ClipboardError::Io(error) => write!(f, "Clipboard storage error: {error}"),
             ClipboardError::PoisonError => write!(f, "Clipboard database lock poisoned"),
             ClipboardError::ItemNotFound => write!(f, "Item not found"),
+            ClipboardError::ImageUnavailable { .. } => write!(f, "Stored image is unavailable"),
         }
     }
 }
@@ -60,6 +64,13 @@ pub struct ClipboardStore {
     reconciliation_entries_consumed: Mutex<usize>,
     #[cfg(test)]
     reconciliation_snapshot_pause: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+}
+
+struct StoredItemRow {
+    text: String,
+    image_file: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 #[cfg(test)]
@@ -130,10 +141,68 @@ impl ClipboardStore {
         Ok(store)
     }
 
+    #[cfg(test)]
     pub fn get_by_hash(&self, hash: &str) -> Option<ClipboardItem> {
         self.try_get_by_hash(hash).ok().flatten()
     }
 
+    pub fn load_for_paste(&self, hash: &str) -> Result<PasteContent, ClipboardError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let row: Option<StoredItemRow> = connection.query_row(
+            "SELECT text, image_file, image_width, image_height FROM clipboard_items WHERE hash = ?1",
+            [hash],
+            |row| Ok(StoredItemRow {
+                text: row.get(0)?,
+                image_file: row.get(1)?,
+                width: row.get(2)?,
+                height: row.get(3)?,
+            }),
+        ).optional()?;
+        drop(connection);
+        let StoredItemRow {
+            text,
+            image_file,
+            width,
+            height,
+        } = row.ok_or(ClipboardError::ItemNotFound)?;
+        let image = match (image_file, width, height) {
+            (Some(image_file), Some(width), Some(height)) => {
+                let rgba = fs::read(self.images_directory.join(image_file)).map_err(|_| {
+                    ClipboardError::ImageUnavailable {
+                        fallback_text: (!text.is_empty()).then(|| text.clone()),
+                    }
+                })?;
+                Some(
+                    ClipboardImage::from_rgba(rgba, width, height).ok_or_else(|| {
+                        ClipboardError::ImageUnavailable {
+                            fallback_text: (!text.is_empty()).then(|| text.clone()),
+                        }
+                    })?,
+                )
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(ClipboardError::ImageUnavailable {
+                    fallback_text: (!text.is_empty()).then(|| text.clone()),
+                })
+            }
+        };
+        match image {
+            Some(image) => Ok(PasteContent::Image {
+                image,
+                fallback_text: (!text.is_empty()).then_some(text),
+            }),
+            None if !text.is_empty() => Ok(PasteContent::Text(text)),
+            None => Err(ClipboardError::ImageUnavailable {
+                fallback_text: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
     fn try_get_by_hash(&self, hash: &str) -> Result<Option<ClipboardItem>, ClipboardError> {
         let connection = self
             .connection
@@ -145,11 +214,11 @@ impl ClipboardStore {
         )?;
 
         Ok(statement
-            .query_row([hash], |row| self.row_to_item(row, true))
+            .query_row([hash], |row| self.row_to_item(row))
             .optional()?)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn exists_by_hash(&self, hash: &str) -> bool {
         self.get_by_hash(hash).is_some()
     }
@@ -397,6 +466,7 @@ impl ClipboardStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn first(&self) -> Option<ClipboardItem> {
         let connection = self.connection.lock().ok()?;
         let mut statement = connection
@@ -406,22 +476,53 @@ impl ClipboardStore {
             )
             .ok()?;
         statement
-            .query_row([], |row| self.row_to_item(row, true))
+            .query_row([], |row| self.row_to_item(row))
             .optional()
             .ok()
             .flatten()
     }
 
+    pub fn first_hash(&self) -> Result<Option<String>, ClipboardError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        connection
+            .query_row(
+                "SELECT hash FROM clipboard_items ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ClipboardError::from)
+    }
+
     #[cfg(test)]
     pub fn list(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
-        self.list_items(true)
+        self.list_items()
     }
 
-    pub fn list_for_display(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
-        self.list_items(false)
+    pub fn list_for_display(&self) -> Result<Vec<HistorySummary>, ClipboardError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ClipboardError::PoisonError)?;
+        let mut statement = connection
+            .prepare("SELECT text, hash, preview FROM clipboard_items ORDER BY updated_at DESC")?;
+        let summaries = statement
+            .query_map([], |row| {
+                Ok(HistorySummary {
+                    text: row.get(0)?,
+                    hash: row.get(1)?,
+                    preview: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(summaries)
     }
 
-    fn list_items(&self, load_images: bool) -> Result<Vec<ClipboardItem>, ClipboardError> {
+    #[cfg(test)]
+    fn list_items(&self) -> Result<Vec<ClipboardItem>, ClipboardError> {
         let connection = self
             .connection
             .lock()
@@ -431,7 +532,7 @@ impl ClipboardStore {
              FROM clipboard_items ORDER BY updated_at DESC",
         )?;
         let items = statement
-            .query_map([], |row| self.row_to_item(row, load_images))?
+            .query_map([], |row| self.row_to_item(row))?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(items)
@@ -660,25 +761,18 @@ impl ClipboardStore {
         Ok(())
     }
 
-    fn row_to_item(
-        &self,
-        row: &rusqlite::Row<'_>,
-        load_image: bool,
-    ) -> rusqlite::Result<ClipboardItem> {
+    #[cfg(test)]
+    fn row_to_item(&self, row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipboardItem> {
         let image_file: Option<String> = row.get(2)?;
         let width: Option<u32> = row.get(3)?;
         let height: Option<u32> = row.get(4)?;
-        let image = if load_image {
-            match (image_file, width, height) {
-                (Some(image_file), Some(width), Some(height)) => {
-                    fs::read(self.images_directory.join(image_file))
-                        .ok()
-                        .and_then(|rgba| ClipboardImage::from_rgba(rgba, width, height))
-                }
-                _ => None,
+        let image = match (image_file, width, height) {
+            (Some(image_file), Some(width), Some(height)) => {
+                fs::read(self.images_directory.join(image_file))
+                    .ok()
+                    .and_then(|rgba| ClipboardImage::from_rgba(rgba, width, height))
             }
-        } else {
-            None
+            _ => None,
         };
 
         Ok(ClipboardItem {
@@ -772,9 +866,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ClipboardStore, Connection, MAX_ITEMS, RECONCILIATION_BATCH_SIZE, RECONCILIATION_SCAN_LIMIT,
+        ClipboardError, ClipboardStore, Connection, MAX_ITEMS, RECONCILIATION_BATCH_SIZE,
+        RECONCILIATION_SCAN_LIMIT,
     };
-    use crate::clipboard::ClipboardImage;
+    use crate::content::ClipboardImage;
     use rusqlite::params;
 
     fn image(width: u32, height: u32, byte: u8) -> ClipboardImage {
@@ -918,7 +1013,6 @@ mod tests {
 
         let item = store.list_for_display().unwrap().remove(0);
 
-        assert!(item.image.is_none());
         assert!(item.preview.is_some());
     }
 
@@ -1010,6 +1104,26 @@ mod tests {
 
         assert!(retrieved.image.is_some());
         assert_eq!(retrieved.text, "alt text");
+    }
+
+    #[test]
+    fn unavailable_image_reports_the_text_fallback_without_treating_it_as_image_content() {
+        let store = ClipboardStore::new();
+        assert!(store.add_image(image(2, 2, 0xff), Some("alt text".into())));
+        let hash = store.first().unwrap().hash;
+        let image_path = fs::read_dir(&store.images_directory)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        fs::remove_file(image_path).unwrap();
+
+        let error = store.load_for_paste(&hash).unwrap_err();
+        assert!(
+            matches!(error, ClipboardError::ImageUnavailable { fallback_text: Some(text) } if text == "alt text")
+        );
+        assert!(store.list_for_display().is_ok());
     }
 
     #[test]
