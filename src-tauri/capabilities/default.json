@@ -8,11 +8,6 @@
   ],
   "permissions": [
     "core:default",
-    "opener:default",
-    "core:window:allow-hide",
-    "core:app:allow-default-window-icon",
-    "global-shortcut:allow-is-registered",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister"
+    "core:app:allow-default-window-icon"
   ]
 }

@@ -30,13 +30,16 @@ impl PickerActivation {
 
     pub fn flush<E>(&self, show_picker: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         self.ready.store(true, Ordering::SeqCst);
-
         let generation = self
             .requested_generation
             .fetch_max(1, Ordering::SeqCst)
             .max(1);
 
-        self.deliver(generation, show_picker)
+        let delivery = self.deliver(generation, show_picker);
+        if delivery.is_err() && self.delivered_generation.load(Ordering::SeqCst) < generation {
+            self.ready.store(false, Ordering::SeqCst);
+        }
+        delivery
     }
 
     fn deliver<E>(
@@ -72,8 +75,7 @@ pub fn register(
             picker_activation.activate_existing_instance(|| test_support::show_picker_window(app));
 
         #[cfg(not(all(debug_assertions, feature = "single-instance-test")))]
-        let delivery =
-            picker_activation.activate_existing_instance(|| crate::window::show_picker_window(app));
+        let delivery = picker_activation.activate_existing_instance(|| crate::picker::open(app));
 
         if let Err(error_value) = delivery {
             error!(error:debug = error_value; "Failed to activate picker window");
@@ -158,7 +160,7 @@ pub mod test_support {
         let app_handle = app.clone();
 
         app.run_on_main_thread(move || {
-            let delivered = crate::window::show_picker_window(&app_handle).is_ok();
+            let delivered = crate::picker::open(&app_handle).is_ok();
             let _ = sender.send(delivered);
         })?;
 
@@ -219,6 +221,13 @@ mod tests {
     };
 
     use super::{run_primary_setup, PickerActivation};
+
+    #[test]
+    fn failed_initial_picker_activation_does_not_mark_it_ready() {
+        let activation = PickerActivation::default();
+        assert!(activation.flush(|| Err::<(), _>(())).is_err());
+        assert!(!activation.ready.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn pre_ready_activation_waits_for_primary_setup_to_flush_it() {

@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -8,51 +7,14 @@ import {
 } from "./capabilities";
 import { ClearHistoryButton } from "./components/ClearHistoryButton";
 import { ListItem } from "./components/ListItem";
+import { useHistory } from "./hooks/useHistory";
 import { logError } from "./log";
-import { getPlatformPresentation, shortcutLabel } from "./platform";
+import { presentationForSession } from "./platform";
+import { SettingsView } from "./SettingsView";
+import { type ShortcutSettings, shortcutFromEvent } from "./shortcuts";
 import "./App.css";
 
-type ClipboardItem = {
-	hash: string;
-	text: string;
-	preview?: string;
-};
-
-type Clipboard = ClipboardItem[];
-
-type PasteOutcome = "Pasted" | "CopiedForManualPaste" | "ClipboardWriteFailed";
-
-type ShortcutSettings = {
-	version: number;
-	openKlipo: string;
-	moveSelectionUp: string;
-	moveSelectionDown: string;
-	pasteSelectedItem: string;
-	deleteSelectedItem: string;
-};
-
-type ShortcutField = Exclude<keyof ShortcutSettings, "version">;
-
-const shortcutFields: Array<[ShortcutField, string]> = [
-	["openKlipo", "Open Klipo"],
-	["moveSelectionUp", "Move selection up"],
-	["moveSelectionDown", "Move selection down"],
-	["pasteSelectedItem", "Paste selected item"],
-	["deleteSelectedItem", "Delete selected item"],
-];
-
-const modifierKeys = new Set(["Meta", "Control", "Alt", "Shift"]);
-
-function shortcutFromEvent(event: KeyboardEvent) {
-	if (modifierKeys.has(event.key) || event.key === "Escape") return null;
-	const modifiers = [
-		event.metaKey && "SUPER",
-		event.ctrlKey && "CTRL",
-		event.altKey && "ALT",
-		event.shiftKey && "SHIFT",
-	].filter(Boolean);
-	return [...modifiers, event.code].join("+");
-}
+type PasteOutcome = "Pasted" | "CopiedForManualPaste";
 
 function isInteractiveTarget(target: EventTarget | null) {
 	return (
@@ -68,14 +30,24 @@ const MenuSeparator = () => (
 );
 
 export function App() {
-	const [clipboard, setClipboard] = useState<Clipboard>([]);
-	const [selectedItem, setSelectedItem] = useState<number | null>(null);
+	const {
+		items: clipboard,
+		selectedHash,
+		setSelectedHash,
+		error: historyError,
+		setError: setHistoryError,
+		refresh: refreshHistory,
+		deleteSelected,
+	} = useHistory();
+	const selectedItem = clipboard.findIndex(
+		(item) => item.hash === selectedHash,
+	);
 	const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
 	const [capabilities, setCapabilities] = useState<DesktopCapabilities | null>(
 		null,
 	);
 	const [manualPasteCopied, setManualPasteCopied] = useState(false);
-	const platformPresentation = getPlatformPresentation();
+	const platformPresentation = presentationForSession(capabilities?.session);
 
 	const historyRef = useRef<HTMLDivElement>(null);
 	const pasteRequest = useRef(0);
@@ -87,19 +59,11 @@ export function App() {
 
 	const hide = useCallback(() => {
 		invalidatePasteRequest();
-		void invoke("close").catch((error) =>
-			logError("Failed to close picker", error),
-		);
-	}, [invalidatePasteRequest]);
-
-	const fetchClipboardHistory = useCallback(async () => {
-		try {
-			const clipboard = await invoke<ClipboardItem[]>("fetch_clipboard");
-			setClipboard(clipboard);
-		} catch (error) {
-			logError("Failed to get clipboard history", error);
-		}
-	}, []);
+		void invoke("close").catch((error) => {
+			logError("Failed to close picker", error);
+			setHistoryError(String(error));
+		});
+	}, [invalidatePasteRequest, setHistoryError]);
 
 	const loadCapabilities = useCallback(async () => {
 		try {
@@ -121,16 +85,19 @@ export function App() {
 
 		try {
 			await invoke("clear");
+			await refreshHistory();
 		} catch (error) {
 			logError("Failed to clear clipboard history", error);
+			setHistoryError(String(error));
 		}
-	}, [invalidatePasteRequest]);
+	}, [invalidatePasteRequest, refreshHistory, setHistoryError]);
 
 	const showSettings = useCallback(() => {
-		void invoke("show_settings").catch((error) =>
-			logError("Failed to show settings", error),
-		);
-	}, []);
+		void invoke("show_settings").catch((error) => {
+			logError("Failed to show settings", error);
+			setHistoryError(String(error));
+		});
+	}, [setHistoryError]);
 
 	const quitApplication = useCallback(() => {
 		void invoke("quit").catch((error) =>
@@ -142,71 +109,38 @@ export function App() {
 		async (hash: string) => {
 			invalidatePasteRequest();
 			const request = pasteRequest.current;
-
 			try {
 				const outcome = await invoke<PasteOutcome>("paste", { hash });
-
-				if (
-					request === pasteRequest.current &&
-					outcome === "CopiedForManualPaste"
-				) {
-					const picker = getCurrentWindow();
-					const showedPicker = await picker
-						.show()
-						.then(() => true)
-						.catch((error) => {
-							logError("Failed to show picker for manual paste", error);
-							return false;
-						});
-					const focusedPicker =
-						request === pasteRequest.current
-							? await picker
-									.setFocus()
-									.then(() => true)
-									.catch((error) => {
-										logError("Failed to focus picker for manual paste", error);
-										return false;
-									})
-							: false;
-
-					if (
-						request === pasteRequest.current &&
-						showedPicker &&
-						focusedPicker
-					) {
-						setManualPasteCopied(true);
-					}
+				if (request !== pasteRequest.current) return;
+				if (outcome === "CopiedForManualPaste") setManualPasteCopied(true);
+			} catch (reason) {
+				logError("Failed to paste from selection", reason);
+				if (request === pasteRequest.current) {
+					setHistoryError(
+						reason instanceof Error ? reason.message : String(reason),
+					);
 				}
-			} catch (error) {
-				logError("Failed to paste from selection", error);
 			}
 		},
-		[invalidatePasteRequest],
+		[invalidatePasteRequest, setHistoryError],
 	);
 
 	const deleteItem = useCallback(
 		async (hash: string) => {
 			invalidatePasteRequest();
-
 			try {
-				await invoke("delete_item", { hash });
-				setSelectedItem((prev) => (prev && prev > 0 ? prev - 1 : null));
-			} catch (error) {
-				logError("Failed to delete clipboard item", error);
+				const outcome = await deleteSelected(hash);
+				if (outcome === "DeletedWithClipboardWarning") {
+					setHistoryError(
+						"Item deleted, but the clipboard could not be updated.",
+					);
+				}
+			} catch (reason) {
+				logError("Failed to delete clipboard item", reason);
+				setHistoryError(String(reason));
 			}
 		},
-		[invalidatePasteRequest],
-	);
-
-	const clipboardMenuItems = useMemo(
-		() =>
-			clipboard.map((item) => ({
-				label: item.text || `Image ${item.hash.slice(0, 8)}`,
-				key: item.hash,
-				onClick: () => pasteFromSelection(item.hash),
-				preview: item.preview,
-			})),
-		[clipboard, pasteFromSelection],
+		[invalidatePasteRequest, deleteSelected, setHistoryError],
 	);
 
 	const handleKeyDown = useCallback(
@@ -233,16 +167,14 @@ export function App() {
 					event.preventDefault();
 
 					newSelectedItem =
-						selectedItem !== null && selectedItem > 0
-							? selectedItem - 1
-							: clipboard.length - 1;
+						selectedItem > 0 ? selectedItem - 1 : clipboard.length - 1;
 
 					break;
 				case shortcuts.moveSelectionDown:
 					event.preventDefault();
 
 					newSelectedItem =
-						selectedItem !== null && selectedItem < clipboard.length - 1
+						selectedItem >= 0 && selectedItem < clipboard.length - 1
 							? selectedItem + 1
 							: 0;
 
@@ -250,7 +182,7 @@ export function App() {
 				case shortcuts.pasteSelectedItem: {
 					event.preventDefault();
 
-					if (selectedItem !== null && isValidItem(selectedItem)) {
+					if (isValidItem(selectedItem)) {
 						pasteFromSelection(clipboard[selectedItem].hash);
 					}
 
@@ -259,7 +191,7 @@ export function App() {
 				case shortcuts.deleteSelectedItem:
 					event.preventDefault();
 
-					if (selectedItem !== null && isValidItem(selectedItem)) {
+					if (isValidItem(selectedItem)) {
 						deleteItem(clipboard[selectedItem].hash);
 					}
 
@@ -268,17 +200,20 @@ export function App() {
 					break;
 			}
 
-			if (newSelectedItem !== null && newSelectedItem !== selectedItem) {
+			if (newSelectedItem >= 0 && newSelectedItem !== selectedItem) {
 				historyRef.current?.children[newSelectedItem]?.scrollIntoView({
 					block: "nearest",
 				});
 			}
 
-			setSelectedItem(newSelectedItem);
+			if (newSelectedItem !== selectedItem) {
+				setSelectedHash(clipboard[newSelectedItem]?.hash ?? null);
+			}
 		},
 		[
 			clipboard,
 			selectedItem,
+			setSelectedHash,
 			pasteFromSelection,
 			hide,
 			deleteItem,
@@ -288,34 +223,20 @@ export function App() {
 	);
 
 	const handleBlur = useCallback(() => {
-		setSelectedItem(null);
+		setSelectedHash(null);
 		setManualPasteCopied(false);
-	}, []);
+	}, [setSelectedHash]);
 
 	const handleFocus = useCallback(() => {
-		fetchClipboardHistory();
+		loadCapabilities();
 		invoke<ShortcutSettings>("get_shortcuts")
 			.then(setShortcuts)
 			.catch((error) => logError("Failed to get keyboard shortcuts", error));
-	}, [fetchClipboardHistory]);
-
-	useEffect(() => {
-		loadCapabilities();
 	}, [loadCapabilities]);
 
 	useEffect(() => {
-		const unlisten = listen<string>("clipboard-changed", async () => {
-			const isVisible = await getCurrentWindow().isVisible();
-
-			if (!isVisible) return;
-
-			fetchClipboardHistory();
-		});
-
-		return () => {
-			unlisten.then((unlisten) => unlisten());
-		};
-	}, [fetchClipboardHistory]);
+		handleFocus();
+	}, [handleFocus]);
 
 	useEffect(() => {
 		window.addEventListener("keydown", handleKeyDown);
@@ -361,6 +282,12 @@ export function App() {
 					</p>
 				)}
 
+				{historyError && (
+					<p role="alert" className="mx-2 text-sm">
+						{historyError}
+					</p>
+				)}
+
 				<MenuSeparator />
 
 				{unavailableCapabilities.length > 0 && (
@@ -373,144 +300,21 @@ export function App() {
 
 				<div
 					ref={historyRef}
-					className={`menu__history${selectedItem === null ? "" : " has-keyboard-selection"}`}
-					onPointerMove={() => setSelectedItem(null)}
+					className={`menu__history${selectedHash === null ? "" : " has-keyboard-selection"}`}
+					onPointerMove={() => setSelectedHash(null)}
 				>
-					{clipboardMenuItems.map((item, idx) => (
-						<ListItem {...item} key={item.key} active={idx === selectedItem} />
+					{clipboard.map((item) => (
+						<ListItem
+							key={item.hash}
+							label={item.text || `Image ${item.hash.slice(0, 8)}`}
+							preview={item.preview}
+							onClick={() => pasteFromSelection(item.hash)}
+							active={item.hash === selectedHash}
+						/>
 					))}
 				</div>
 			</div>
 		</div>
-	);
-}
-
-function SettingsView() {
-	const [saved, setSaved] = useState<ShortcutSettings | null>(null);
-	const [draft, setDraft] = useState<ShortcutSettings | null>(null);
-	const [recording, setRecording] = useState<ShortcutField | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const platformPresentation = getPlatformPresentation();
-
-	const load = useCallback(
-		() =>
-			invoke<ShortcutSettings>("get_shortcuts")
-				.then((settings) => {
-					setSaved(settings);
-					setDraft(settings);
-				})
-				.catch((reason) => {
-					logError("Failed to load keyboard shortcuts", reason);
-					setError(String(reason));
-				}),
-		[],
-	);
-
-	useEffect(() => {
-		load();
-		window.addEventListener("focus", load);
-		return () => window.removeEventListener("focus", load);
-	}, [load]);
-
-	useEffect(() => {
-		if (!recording) return;
-		const record = (event: KeyboardEvent) => {
-			event.preventDefault();
-			event.stopPropagation();
-			if (event.key === "Escape") {
-				setRecording(null);
-				getCurrentWindow()
-					.hide()
-					.catch((error) => logError("Failed to hide settings window", error));
-				return;
-			}
-			const shortcut = shortcutFromEvent(event);
-			if (!shortcut) {
-				setError("Escape and modifier-only shortcuts cannot be used.");
-				return;
-			}
-			setDraft((current) => current && { ...current, [recording]: shortcut });
-			setError(null);
-			setRecording(null);
-		};
-		window.addEventListener("keydown", record, true);
-		return () => window.removeEventListener("keydown", record, true);
-	}, [recording]);
-
-	if (!draft || !saved) {
-		if (error)
-			return (
-				<main
-					className={`settings settings__error ${platformPresentation.className}`}
-					role="alert"
-				>
-					{error}
-				</main>
-			);
-		return (
-			<main className={`settings ${platformPresentation.className}`}>
-				Loading settings…
-			</main>
-		);
-	}
-
-	const save = async () => {
-		try {
-			const updated = await invoke<ShortcutSettings>("save_shortcuts", {
-				settings: draft,
-			});
-			setSaved(updated);
-			setDraft(updated);
-			setError(null);
-		} catch (reason) {
-			logError("Failed to save keyboard shortcuts", reason);
-			setError(String(reason));
-		}
-	};
-
-	return (
-		<main className={`settings ${platformPresentation.className}`}>
-			<h1>Keyboard shortcuts</h1>
-			<p>
-				Click a shortcut, then press one key combination. Escape always closes
-				Klipo.
-			</p>
-			{shortcutFields.map(([field, label]) => (
-				<label className="settings__field" key={field}>
-					<span>{label}</span>
-					<button
-						type="button"
-						className={
-							recording === field
-								? "settings__shortcut is-recording"
-								: "settings__shortcut"
-						}
-						onClick={() => {
-							setRecording(field);
-							setError(null);
-						}}
-					>
-						{recording === field
-							? "Press shortcut…"
-							: shortcutLabel(draft[field])}
-					</button>
-				</label>
-			))}
-			{error && (
-				<p className="settings__error" role="alert">
-					{error}
-				</p>
-			)}
-			<div className="settings__actions">
-				<button
-					type="button"
-					onClick={save}
-					disabled={JSON.stringify(saved) === JSON.stringify(draft)}
-				>
-					Save changes
-				</button>
-			</div>
-		</main>
 	);
 }
 

@@ -7,37 +7,14 @@ use crate::state::AppState;
 const MAIN_WINDOW_LABEL: &str = "main";
 const SETTINGS_WINDOW_LABEL: &str = "settings";
 
-pub struct Settings {
-    pub width: f64,
-    pub height: f64,
-    pub transparent: bool,
-    pub decorations: bool,
-}
-
 pub(crate) const PICKER_WIDTH: f64 = 250.0;
 pub(crate) const PICKER_HEIGHT: f64 = 350.0;
 
-#[derive(Debug)]
-pub enum WindowError {
-    TauriError(tauri::Error),
-}
-
-impl std::fmt::Display for WindowError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WindowError::TauriError(e) => write!(f, "Tauri error: {e}"),
-        }
-    }
-}
-
-pub fn create_klipo_window(
-    app: &tauri::AppHandle,
-    settings: Settings,
-) -> Result<WebviewWindow, WindowError> {
+pub fn create_picker_window(app: &tauri::AppHandle) -> Result<WebviewWindow, tauri::Error> {
     let window_builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::default())
-        .inner_size(settings.width, settings.height)
-        .decorations(settings.decorations)
-        .transparent(settings.transparent)
+        .inner_size(PICKER_WIDTH, PICKER_HEIGHT)
+        .decorations(false)
+        .transparent(cfg!(target_os = "macos"))
         .always_on_top(true)
         .visible(false)
         .visible_on_all_workspaces(true)
@@ -56,37 +33,11 @@ pub fn create_klipo_window(
                 .build(),
         );
 
-    let window = window_builder.build();
-
-    let window = match window {
-        Ok(window) => window,
-        Err(e) => return Err(WindowError::TauriError(e)),
-    };
-
-    Ok(window)
-}
-
-pub fn create_picker_window(app: &tauri::AppHandle) -> Result<WebviewWindow, WindowError> {
-    create_klipo_window(
-        app,
-        Settings {
-            width: PICKER_WIDTH,
-            height: PICKER_HEIGHT,
-            transparent: cfg!(target_os = "macos"),
-            decorations: false,
-        },
-    )
+    window_builder.build()
 }
 
 pub fn get_main_window(app: &tauri::AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window(MAIN_WINDOW_LABEL)
-}
-
-pub fn show_picker_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
-    let window = get_main_window(app).ok_or(tauri::Error::WindowNotFound)?;
-
-    window.show()?;
-    window.set_focus()
 }
 
 pub fn show_settings_window(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
@@ -113,6 +64,13 @@ pub fn window_events_handler(window: &Window, event: &WindowEvent) {
     }
     if let WindowEvent::Focused(focused) = event {
         if !focused {
+            if let Some(state) = window.app_handle().try_state::<AppState>() {
+                if state.paste_focus_loss_expected() || window.is_focused().unwrap_or(false) {
+                    return;
+                }
+                state.dismiss_picker_session();
+                clear_focus_target(&state);
+            }
             let _ = window.hide();
         }
     }
@@ -127,10 +85,12 @@ pub enum FocusError {
 
 /// Opaque platform focus target. Native process identifiers remain private to
 /// this module so callers can only capture, restore, or compare focus.
+#[derive(Clone)]
 pub(crate) struct FocusTarget {
     target: FocusTargetKind,
 }
 
+#[derive(Clone)]
 enum FocusTargetKind {
     Empty,
     #[cfg(target_os = "macos")]
@@ -152,9 +112,16 @@ impl FocusTarget {
         Self::default()
     }
 
-    fn current() -> Result<Self, FocusError> {
+    fn is_available(&self) -> bool {
+        !matches!(self.target, FocusTargetKind::Empty)
+    }
+
+    fn current(session: crate::desktop::DesktopSession) -> Result<Self, FocusError> {
         #[cfg(target_os = "macos")]
         {
+            if session != crate::desktop::DesktopSession::Macos {
+                return Err(FocusError::PlatformUnsupported);
+            }
             let process_id = focused_process_id().ok_or(FocusError::FocusedWindowUnavailable)?;
             Ok(Self {
                 target: FocusTargetKind::MacosProcess(process_id),
@@ -163,7 +130,7 @@ impl FocusTarget {
 
         #[cfg(target_os = "linux")]
         {
-            if crate::desktop::detect_session() == crate::desktop::DesktopSession::X11 {
+            if session == crate::desktop::DesktopSession::X11 {
                 x11::capture().map(|target| Self {
                     target: FocusTargetKind::X11(target),
                 })
@@ -211,7 +178,21 @@ pub fn capture_focused_window(state: &AppState) -> Result<(), FocusError> {
         .lock()
         .map_err(|_| FocusError::StatePoisoned)?;
 
-    replace_focus_target(&mut focus_target, FocusTarget::current())
+    replace_focus_target(&mut focus_target, FocusTarget::current(state.session))
+}
+
+pub fn clear_focus_target(state: &AppState) {
+    if let Ok(mut focus_target) = state.focus_target.lock() {
+        *focus_target = FocusTarget::empty();
+    }
+}
+
+pub fn has_focused_target(state: &AppState) -> bool {
+    state
+        .focus_target
+        .lock()
+        .map(|focus_target| focus_target.is_available())
+        .unwrap_or(false)
 }
 
 fn replace_focus_target(
@@ -234,7 +215,8 @@ pub fn restore_focused_window(state: &AppState) -> Result<(), FocusError> {
     let focus_target = state
         .focus_target
         .lock()
-        .map_err(|_| FocusError::StatePoisoned)?;
+        .map_err(|_| FocusError::StatePoisoned)?
+        .clone();
 
     focus_target.restore()
 }
@@ -316,7 +298,7 @@ mod x11 {
     const ACTIVE_WINDOW: &[u8] = b"_NET_ACTIVE_WINDOW";
     const ACTIVATION_RETRIES: usize = 10;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub(super) struct FocusTarget {
         window: Window,
     }

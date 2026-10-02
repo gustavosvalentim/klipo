@@ -1,7 +1,5 @@
 use md5::{Digest, Md5};
-use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
@@ -13,33 +11,13 @@ use clipboard_rs::{
 use log::{debug, error};
 use tauri::{Emitter, Manager};
 
+#[cfg(test)]
+use crate::content::ClipboardItem;
+use crate::content::{ClipboardImage, ClipboardSnapshot, PasteContent};
 use crate::state::AppState;
 
 const SELF_WRITE_MARKER_TTL: Duration = Duration::from_secs(2);
 const MAX_SELF_WRITE_MARKERS: usize = 8;
-
-#[derive(Debug, Clone)]
-pub struct ClipboardImage {
-    pub rgba: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl ClipboardImage {
-    pub fn from_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Option<Self> {
-        let pixel_count = (width as usize).checked_mul(height as usize)?;
-        let byte_count = pixel_count.checked_mul(4)?;
-        if width == 0 || height == 0 || rgba.len() != byte_count {
-            return None;
-        }
-
-        Some(Self {
-            rgba,
-            width,
-            height,
-        })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemClipboardError {
@@ -68,12 +46,6 @@ impl std::fmt::Display for SystemClipboardError {
 }
 
 impl std::error::Error for SystemClipboardError {}
-
-#[derive(Debug, Default)]
-pub struct ClipboardSnapshot {
-    pub image: Option<ClipboardImage>,
-    pub text: Option<String>,
-}
 
 trait ClipboardBackend: Send {
     fn get(&self, formats: &[ContentFormat])
@@ -141,6 +113,62 @@ struct SelfWriteMarkers {
     entries: VecDeque<SelfWriteMarker>,
 }
 
+impl SelfWriteMarkers {
+    fn expire(&mut self, now: Instant) {
+        self.entries.retain(|marker| marker.expires_at > now);
+    }
+
+    fn arm(&mut self, signature: ClipboardSignature, now: Instant) -> u64 {
+        self.expire(now);
+        while self.entries.len() >= MAX_SELF_WRITE_MARKERS {
+            self.entries.pop_front();
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let marker_id = self.next_id;
+        self.entries.push_back(SelfWriteMarker {
+            id: marker_id,
+            signature,
+            expires_at: now + SELF_WRITE_MARKER_TTL,
+        });
+        marker_id
+    }
+
+    fn retain(&mut self, marker_id: u64, signature: ClipboardSignature, now: Instant) {
+        self.expire(now);
+        if let Some(marker) = self
+            .entries
+            .iter_mut()
+            .find(|marker| marker.id == marker_id)
+        {
+            marker.signature = signature;
+            marker.expires_at = now + SELF_WRITE_MARKER_TTL;
+        }
+    }
+
+    fn cancel(&mut self, marker_id: u64) {
+        self.entries.retain(|marker| marker.id != marker_id);
+    }
+
+    fn reconcile(&mut self, signature: Option<ClipboardSignature>, now: Instant) -> bool {
+        self.expire(now);
+        let matching_marker = signature.and_then(|signature| {
+            self.entries
+                .iter()
+                .rposition(|marker| marker.signature == signature)
+        });
+        match matching_marker {
+            Some(index) => {
+                self.entries.drain(..=index);
+                true
+            }
+            None => {
+                self.entries.clear();
+                false
+            }
+        }
+    }
+}
+
 impl SystemClipboard {
     pub fn new() -> Result<Self, SystemClipboardError> {
         let context = ClipboardContext::new().map_err(|_| SystemClipboardError::Initialization)?;
@@ -183,24 +211,32 @@ impl SystemClipboard {
         Ok(snapshot_from_contents(contents))
     }
 
-    pub fn write_item(&self, item: &ClipboardItem) -> Result<(), SystemClipboardError> {
-        let text = (!item.text.is_empty()).then_some(item.text.as_str());
-
+    pub fn write_content(&self, content: &PasteContent) -> Result<(), SystemClipboardError> {
         let context = self
             .context
             .lock()
             .map_err(|_| SystemClipboardError::LockPoisoned)?;
-
-        match (item.image.as_ref(), text) {
-            (Some(image), Some(text)) => self.write_mixed(
+        match content {
+            PasteContent::Text(text) if !text.is_empty() => self.write_and_verify(
+                context.as_ref(),
+                vec![ClipboardContent::Text(text.clone())],
+                false,
+                true,
+                signature_for_content(None, Some(text)),
+            ),
+            PasteContent::Text(_) => Err(SystemClipboardError::EmptyContent),
+            PasteContent::Image {
+                image,
+                fallback_text: Some(text),
+            } if !text.is_empty() => self.write_mixed(
                 context.as_ref(),
                 rust_image_from_clipboard(image),
                 text,
                 signature_for_content(Some(image), Some(text)),
             ),
-            (Some(clipboard_image), None) => {
-                let signature = signature_for_content(Some(clipboard_image), None);
-                let image = rust_image_from_clipboard(clipboard_image)?;
+            PasteContent::Image { image, .. } => {
+                let signature = signature_for_content(Some(image), None);
+                let image = rust_image_from_clipboard(image)?;
                 self.write_and_verify(
                     context.as_ref(),
                     vec![ClipboardContent::Image(image)],
@@ -209,15 +245,19 @@ impl SystemClipboard {
                     signature,
                 )
             }
-            (None, Some(text)) => self.write_and_verify(
-                context.as_ref(),
-                vec![ClipboardContent::Text(text.to_owned())],
-                false,
-                true,
-                signature_for_content(None, Some(text)),
-            ),
-            (None, None) => Err(SystemClipboardError::EmptyContent),
         }
+    }
+
+    #[cfg(test)]
+    pub fn write_item(&self, item: &ClipboardItem) -> Result<(), SystemClipboardError> {
+        let content = match &item.image {
+            Some(image) => PasteContent::Image {
+                image: image.clone(),
+                fallback_text: (!item.text.is_empty()).then(|| item.text.clone()),
+            },
+            None => PasteContent::Text(item.text.clone()),
+        };
+        self.write_content(&content)
     }
 
     fn write_mixed(
@@ -245,7 +285,7 @@ impl SystemClipboard {
                     Ok(())
                 } else {
                     let fallback_signature = signature_for_content(None, Some(text));
-                    self.update_self_write(marker_id, fallback_signature)?;
+                    self.retain_self_write(marker_id, fallback_signature)?;
                     let fallback_result = write_and_verify(
                         context,
                         vec![ClipboardContent::Text(text.to_owned())],
@@ -298,21 +338,7 @@ impl SystemClipboard {
             .self_write_markers
             .lock()
             .map_err(|_| SystemClipboardError::LockPoisoned)?;
-        markers.entries.retain(|marker| marker.expires_at > now);
-
-        while markers.entries.len() >= MAX_SELF_WRITE_MARKERS {
-            markers.entries.pop_front();
-        }
-
-        markers.next_id = markers.next_id.wrapping_add(1);
-        let marker_id = markers.next_id;
-        markers.entries.push_back(SelfWriteMarker {
-            id: marker_id,
-            signature,
-            expires_at: now + SELF_WRITE_MARKER_TTL,
-        });
-
-        Ok(marker_id)
+        Ok(markers.arm(signature, now))
     }
 
     fn retain_self_write(
@@ -325,41 +351,7 @@ impl SystemClipboard {
             .self_write_markers
             .lock()
             .map_err(|_| SystemClipboardError::LockPoisoned)?;
-        markers.entries.retain(|marker| marker.expires_at > now);
-
-        if let Some(marker) = markers
-            .entries
-            .iter_mut()
-            .find(|marker| marker.id == marker_id)
-        {
-            marker.signature = signature;
-            marker.expires_at = now + SELF_WRITE_MARKER_TTL;
-        }
-
-        Ok(())
-    }
-
-    fn update_self_write(
-        &self,
-        marker_id: u64,
-        signature: ClipboardSignature,
-    ) -> Result<(), SystemClipboardError> {
-        let now = self.clock.now();
-        let mut markers = self
-            .self_write_markers
-            .lock()
-            .map_err(|_| SystemClipboardError::LockPoisoned)?;
-        markers.entries.retain(|marker| marker.expires_at > now);
-
-        if let Some(marker) = markers
-            .entries
-            .iter_mut()
-            .find(|marker| marker.id == marker_id)
-        {
-            marker.signature = signature;
-            marker.expires_at = now + SELF_WRITE_MARKER_TTL;
-        }
-
+        markers.retain(marker_id, signature, now);
         Ok(())
     }
 
@@ -368,36 +360,16 @@ impl SystemClipboard {
             .self_write_markers
             .lock()
             .map_err(|_| SystemClipboardError::LockPoisoned)?;
-        markers.entries.retain(|marker| marker.id != marker_id);
+        markers.cancel(marker_id);
         Ok(())
     }
 
     fn reconcile_self_write(&self, snapshot: &ClipboardSnapshot) -> bool {
         let now = self.clock.now();
-        let snapshot_signature = signature_for_snapshot(snapshot);
-        let markers = self.self_write_markers.lock();
-
-        let Ok(mut markers) = markers else {
-            return false;
-        };
-        markers.entries.retain(|marker| marker.expires_at > now);
-
-        let matching_marker = snapshot_signature.and_then(|signature| {
-            markers
-                .entries
-                .iter()
-                .rposition(|marker| marker.signature == signature)
-        });
-
-        match matching_marker {
-            Some(index) => {
-                markers.entries.drain(..=index);
-                true
-            }
-            None => {
-                markers.entries.clear();
-                false
-            }
+        let signature = signature_for_snapshot(snapshot);
+        match self.self_write_markers.lock() {
+            Ok(mut markers) => markers.reconcile(signature, now),
+            Err(_) => false,
         }
     }
 
@@ -556,16 +528,6 @@ fn capture_clipboard_change(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ClipboardItem {
-    pub text: String,
-    pub hash: String,
-    #[serde(skip)]
-    pub image: Option<ClipboardImage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preview: Option<String>,
-}
-
 #[derive(Debug)]
 pub struct ClipboardWatcherInitializationError;
 
@@ -588,7 +550,7 @@ impl ClipboardEventsListener {
     {
         let mut watcher =
             ClipboardWatcherContext::new().map_err(|_| ClipboardWatcherInitializationError)?;
-        watcher.add_handler(ClipboardEventsHandler::new(Arc::new(app_handler)));
+        watcher.add_handler(ClipboardEventsHandler::new(app_handler));
         let shutdown = watcher.get_shutdown_channel();
         Ok((Self { watcher }, shutdown))
     }
@@ -599,11 +561,11 @@ impl ClipboardEventsListener {
 }
 
 pub struct ClipboardEventsHandler {
-    app: Arc<tauri::AppHandle>,
+    app: tauri::AppHandle,
 }
 
 impl ClipboardEventsHandler {
-    pub fn new(app: Arc<tauri::AppHandle>) -> Self {
+    pub fn new(app: tauri::AppHandle) -> Self {
         Self { app }
     }
 }
@@ -634,43 +596,6 @@ impl ClipboardHandler for ClipboardEventsHandler {
             }
         }
     }
-}
-
-const THUMBNAIL_MAX_SIZE: u32 = 20;
-
-pub(crate) fn generate_preview(image: &ClipboardImage) -> Option<String> {
-    let (new_w, new_h) = if image.width > THUMBNAIL_MAX_SIZE || image.height > THUMBNAIL_MAX_SIZE {
-        if image.width > image.height {
-            let h = (image.height * THUMBNAIL_MAX_SIZE).max(1) / image.width;
-            (THUMBNAIL_MAX_SIZE, h.max(1))
-        } else if image.height > image.width {
-            let w = (image.width * THUMBNAIL_MAX_SIZE).max(1) / image.height;
-            (w.max(1), THUMBNAIL_MAX_SIZE)
-        } else {
-            (THUMBNAIL_MAX_SIZE, THUMBNAIL_MAX_SIZE)
-        }
-    } else {
-        (image.width, image.height)
-    };
-
-    let mut png_bytes = Vec::new();
-    {
-        use image::imageops::FilterType;
-        use image::ImageFormat;
-        use image::RgbaImage;
-        use std::io::Cursor;
-
-        let img = RgbaImage::from_raw(image.width, image.height, image.rgba.clone())?;
-        let thumb = image::imageops::resize(&img, new_w, new_h, FilterType::Nearest);
-        thumb
-            .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
-            .ok()?;
-    }
-
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-
-    Some(format!("data:image/png;base64,{b64}"))
 }
 
 const CLIPBOARD_CHANGED_EVENT: &str = "clipboard-changed";

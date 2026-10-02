@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { getPlatformPresentation, shortcutLabel } from "./platform";
+import {
+	getPlatformPresentation,
+	presentationForSession,
+	shortcutLabel,
+} from "./platform";
 
 describe("platform presentation", () => {
 	it("uses readable Linux shortcut terminology and opaque presentation styles", () => {
@@ -17,5 +21,10 @@ describe("platform presentation", () => {
 		expect(presentation.className).toBe("platform-macos");
 		expect(shortcutLabel("SUPER+SHIFT+KeyV", "MacIntel")).toBe("⌘⇧V");
 		expect(shortcutLabel("CTRL+ArrowDown+Backspace", "MacIntel")).toBe("⌃↓⌫");
+	});
+
+	it("uses the native session for platform presentation", () => {
+		expect(presentationForSession("macos").className).toBe("platform-macos");
+		expect(presentationForSession("wayland").className).toBe("platform-linux");
 	});
 });

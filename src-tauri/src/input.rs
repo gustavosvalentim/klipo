@@ -58,15 +58,7 @@ fn simulate_paste_input_with(input: &mut impl KeyInput, mod_key: Key) -> Result<
 }
 
 pub fn supports_input(session: DesktopSession) -> bool {
-    supports_input_on(std::env::consts::OS, session)
-}
-
-fn supports_input_on(platform: &str, session: DesktopSession) -> bool {
-    match platform {
-        "macos" => true,
-        "linux" => matches!(session, DesktopSession::X11),
-        _ => false,
-    }
+    matches!(session, DesktopSession::Macos | DesktopSession::X11)
 }
 
 #[cfg(test)]
@@ -197,10 +189,10 @@ mod tests {
 
     #[test]
     fn limits_linux_input_to_x11_but_preserves_macos_support() {
-        assert!(supports_input_on("linux", DesktopSession::X11));
-        assert!(!supports_input_on("linux", DesktopSession::Wayland));
-        assert!(!supports_input_on("linux", DesktopSession::Unknown));
-        assert!(supports_input_on("macos", DesktopSession::Unknown));
+        assert!(supports_input(DesktopSession::X11));
+        assert!(!supports_input(DesktopSession::Wayland));
+        assert!(!supports_input(DesktopSession::Unknown));
+        assert!(supports_input(DesktopSession::Macos));
     }
 }
 
