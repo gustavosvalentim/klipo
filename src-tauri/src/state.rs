@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use clipboard_rs::WatcherShutdown;
@@ -13,28 +14,8 @@ use crate::settings::ShortcutSettings;
 use crate::storage::{ClipboardError, ClipboardStore};
 use crate::window::FocusTarget;
 
-#[derive(Debug)]
-pub enum AppStateError {
-    Clipboard(ClipboardError),
-}
-
-impl std::fmt::Display for AppStateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Clipboard(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for AppStateError {}
-
-impl From<ClipboardError> for AppStateError {
-    fn from(error: ClipboardError) -> Self {
-        Self::Clipboard(error)
-    }
-}
-
 pub struct AppState {
+    pub session: DesktopSession,
     pub clipboard: ClipboardStore,
     pub system_clipboard: Option<SystemClipboard>,
     pub input: InputState,
@@ -42,21 +23,25 @@ pub struct AppState {
     pub shortcuts: Mutex<ShortcutSettings>,
     clipboard_watcher_shutdown: Mutex<Option<WatcherShutdown>>,
     capabilities: Mutex<DesktopCapabilities>,
+    picker_generation: AtomicU64,
+    paste_in_progress: Mutex<()>,
+    paste_focus_loss_expected: AtomicBool,
 }
 
 impl AppState {
     pub fn new(
         database_path: impl AsRef<Path>,
         session: DesktopSession,
-    ) -> Result<Self, AppStateError> {
+    ) -> Result<Self, ClipboardError> {
         let unavailable_reason = match session {
             DesktopSession::Unknown => CapabilityUnavailableReason::UnknownSession,
-            DesktopSession::X11 | DesktopSession::Wayland => {
+            DesktopSession::Macos | DesktopSession::X11 | DesktopSession::Wayland => {
                 CapabilityUnavailableReason::AdapterUnavailable
             }
         };
 
         Ok(Self {
+            session,
             clipboard: ClipboardStore::open(database_path)?,
             system_clipboard: None,
             input: InputState::new(),
@@ -67,6 +52,9 @@ impl AppState {
                 session,
                 unavailable_reason,
             )),
+            picker_generation: AtomicU64::new(0),
+            paste_in_progress: Mutex::new(()),
+            paste_focus_loss_expected: AtomicBool::new(false),
         })
     }
 
@@ -104,12 +92,6 @@ impl AppState {
         }
     }
 
-    pub fn replace_capabilities(&self, capabilities: DesktopCapabilities) {
-        if let Ok(mut current) = self.capabilities.lock() {
-            *current = capabilities;
-        }
-    }
-
     pub fn capability_is_available(&self, capability: DesktopCapability) -> bool {
         self.capabilities()
             .map(|capabilities| capabilities.status(capability) == CapabilityStatus::available())
@@ -122,11 +104,69 @@ impl AppState {
             .map(|capabilities| capabilities.clone())
             .map_err(|_| "Desktop capability state is unavailable".to_owned())
     }
+
+    pub fn next_picker_session(&self) -> u64 {
+        self.paste_focus_loss_expected
+            .store(false, Ordering::SeqCst);
+        self.picker_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn picker_session(&self) -> u64 {
+        self.picker_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn picker_session_is_current(&self, generation: u64) -> bool {
+        self.picker_session() == generation
+    }
+
+    pub fn dismiss_picker_session(&self) {
+        self.picker_generation.fetch_add(1, Ordering::SeqCst);
+        self.paste_focus_loss_expected
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn expect_paste_focus_loss(&self, expected: bool) {
+        self.paste_focus_loss_expected
+            .store(expected, Ordering::SeqCst);
+    }
+
+    pub fn paste_focus_loss_expected(&self) -> bool {
+        self.paste_focus_loss_expected.load(Ordering::SeqCst)
+    }
+
+    pub fn begin_paste(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.paste_in_progress
+            .try_lock()
+            .map_err(|error_value| match error_value {
+                std::sync::TryLockError::WouldBlock => "A paste is already in progress".to_owned(),
+                std::sync::TryLockError::Poisoned(_) => "Paste state is unavailable".to_owned(),
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn dismissed_sessions_invalidate_pending_picker_work_and_pastes_do_not_overlap() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new(
+            directory.path().join("history.sqlite3"),
+            DesktopSession::Macos,
+        )
+        .unwrap();
+        let first_session = state.next_picker_session();
+        let paste = state.begin_paste().unwrap();
+        assert!(state.begin_paste().is_err());
+        drop(paste);
+
+        state.dismiss_picker_session();
+        assert!(!state.picker_session_is_current(first_session));
+        assert!(state.begin_paste().is_ok());
+    }
 
     #[test]
     fn independently_updates_capabilities_without_disabling_the_session() {

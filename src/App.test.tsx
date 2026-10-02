@@ -91,8 +91,8 @@ describe("App", () => {
 
 		await waitFor(() => {
 			expect(screen.getByRole("status").textContent).toBe("Copied");
-			expect(mocks.currentWindow.show).toHaveBeenCalledOnce();
-			expect(mocks.currentWindow.setFocus).toHaveBeenCalledOnce();
+			expect(mocks.currentWindow.show).not.toHaveBeenCalled();
+			expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
 		});
 
 		fireEvent.blur(window);
@@ -111,7 +111,6 @@ describe("App", () => {
 
 	it.each([
 		"Pasted",
-		"ClipboardWriteFailed",
 	])("does not change picker presentation for %s", async (outcome) => {
 		configurePaste(() => Promise.resolve(outcome));
 		const item = await renderPicker();
@@ -124,32 +123,17 @@ describe("App", () => {
 		expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
 	});
 
-	it("does not announce manual paste when showing the picker fails", async () => {
-		mocks.currentWindow.show.mockRejectedValueOnce(new Error("show failed"));
-		const item = await renderPicker();
-		fireEvent.click(item);
-
-		await waitFor(() => {
-			expect(mocks.currentWindow.show).toHaveBeenCalledOnce();
-			expect(mocks.currentWindow.setFocus).toHaveBeenCalledOnce();
-		});
-
-		expect(screen.queryByRole("status")).toBeNull();
-	});
-
-	it("does not announce manual paste when focusing the picker fails", async () => {
-		mocks.currentWindow.setFocus.mockRejectedValueOnce(
-			new Error("focus failed"),
+	it("shows a clipboard write failure", async () => {
+		configurePaste(() =>
+			Promise.reject(new Error("Could not copy this item.")),
 		);
 		const item = await renderPicker();
 		fireEvent.click(item);
-
-		await waitFor(() => {
-			expect(mocks.currentWindow.show).toHaveBeenCalledOnce();
-			expect(mocks.currentWindow.setFocus).toHaveBeenCalledOnce();
-		});
-
-		expect(screen.queryByRole("status")).toBeNull();
+		await waitFor(() =>
+			expect(screen.getByRole("alert").textContent).toBe(
+				"Could not copy this item.",
+			),
+		);
 	});
 
 	it("does not recover a stale manual-paste outcome after Escape", async () => {
@@ -235,6 +219,146 @@ describe("App", () => {
 		await waitFor(() => {
 			expect(mocks.invoke).toHaveBeenCalledWith("close");
 		});
+	});
+
+	it("loads history on mount and preserves it when a later fetch fails", async () => {
+		let fetches = 0;
+		mocks.invoke.mockImplementation((command: string) => {
+			if (command === "fetch_clipboard") {
+				fetches += 1;
+				return fetches === 1
+					? Promise.resolve([{ hash: "text:known", text: "Clipboard entry" }])
+					: Promise.reject(new Error("database unavailable"));
+			}
+			return Promise.resolve();
+		});
+		render(<App />);
+		await screen.findByRole("button", { name: "Clipboard entry" });
+		fireEvent.focus(window);
+		await waitFor(() =>
+			expect(screen.getByRole("alert").textContent).toContain("Could not load"),
+		);
+		expect(
+			screen.getByRole("button", { name: "Clipboard entry" }),
+		).toBeTruthy();
+	});
+
+	it("keeps the selected identity when history is inserted or reordered", async () => {
+		const first = [
+			{ hash: "a", text: "A" },
+			{ hash: "b", text: "B" },
+		];
+		const second = [
+			{ hash: "c", text: "C" },
+			{ hash: "b", text: "B" },
+			{ hash: "a", text: "A" },
+		];
+		let history = first;
+		mocks.invoke.mockImplementation((command: string) => {
+			if (command === "fetch_clipboard") return Promise.resolve(history);
+			if (command === "get_shortcuts")
+				return Promise.resolve({
+					moveSelectionDown: "ArrowDown",
+					pasteSelectedItem: "Enter",
+				});
+			if (command === "paste") return Promise.resolve("Pasted");
+			return Promise.resolve();
+		});
+		render(<App />);
+		await screen.findByRole("button", { name: "B" });
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+		history = second;
+		fireEvent.focus(window);
+		await screen.findByRole("button", { name: "C" });
+		fireEvent.keyDown(window, { key: "Enter", code: "Enter" });
+		await waitFor(() =>
+			expect(mocks.invoke).toHaveBeenCalledWith("paste", { hash: "b" }),
+		);
+	});
+
+	it("selects the preceding survivor after deleting the selected row", async () => {
+		let history = [
+			{ hash: "a", text: "A" },
+			{ hash: "b", text: "B" },
+			{ hash: "c", text: "C" },
+		];
+		mocks.invoke.mockImplementation((command: string) => {
+			if (command === "fetch_clipboard") return Promise.resolve(history);
+			if (command === "get_shortcuts")
+				return Promise.resolve({
+					moveSelectionDown: "ArrowDown",
+					deleteSelectedItem: "Delete",
+					pasteSelectedItem: "Enter",
+				});
+			if (command === "delete_item") {
+				history = [history[0], history[2]];
+				return Promise.resolve("Deleted");
+			}
+			if (command === "paste") return Promise.resolve("Pasted");
+			return Promise.resolve();
+		});
+		render(<App />);
+		await screen.findByRole("button", { name: "B" });
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+		fireEvent.keyDown(window, { key: "Delete", code: "Delete" });
+		await waitFor(() =>
+			expect(screen.queryByRole("button", { name: "B" })).toBeNull(),
+		);
+		fireEvent.keyDown(window, { key: "Enter", code: "Enter" });
+		await waitFor(() =>
+			expect(mocks.invoke).toHaveBeenCalledWith("paste", { hash: "a" }),
+		);
+	});
+
+	it("keeps selection after a failed delete", async () => {
+		mocks.invoke.mockImplementation((command: string) => {
+			if (command === "fetch_clipboard")
+				return Promise.resolve([{ hash: "a", text: "A" }]);
+			if (command === "get_shortcuts")
+				return Promise.resolve({
+					moveSelectionDown: "ArrowDown",
+					deleteSelectedItem: "Delete",
+					pasteSelectedItem: "Enter",
+				});
+			if (command === "delete_item")
+				return Promise.reject(new Error("database unavailable"));
+			if (command === "paste") return Promise.resolve("Pasted");
+			return Promise.resolve();
+		});
+		render(<App />);
+		await screen.findByRole("button", { name: "A" });
+		fireEvent.keyDown(window, { key: "ArrowDown", code: "ArrowDown" });
+		fireEvent.keyDown(window, { key: "Delete", code: "Delete" });
+		await screen.findByRole("alert");
+		fireEvent.keyDown(window, { key: "Enter", code: "Enter" });
+		await waitFor(() =>
+			expect(mocks.invoke).toHaveBeenCalledWith("paste", { hash: "a" }),
+		);
+	});
+
+	it("ignores an older fetch that resolves after a newer one", async () => {
+		let resolveOld!: (items: unknown[]) => void;
+		const oldFetch = new Promise<unknown[]>((resolve) => {
+			resolveOld = resolve;
+		});
+		let fetches = 0;
+		mocks.invoke.mockImplementation((command: string) => {
+			if (command === "fetch_clipboard") {
+				fetches += 1;
+				return fetches === 1
+					? oldFetch
+					: Promise.resolve([{ hash: "new", text: "New" }]);
+			}
+			return Promise.resolve();
+		});
+		render(<App />);
+		fireEvent.focus(window);
+		await screen.findByRole("button", { name: "New" });
+		resolveOld([{ hash: "old", text: "Old" }]);
+		await nextTick();
+		expect(screen.queryByRole("button", { name: "Old" })).toBeNull();
 	});
 
 	it("keeps picker shortcuts active outside interactive controls", async () => {

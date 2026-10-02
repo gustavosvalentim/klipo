@@ -4,6 +4,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopSession {
+    Macos,
     X11,
     Wayland,
     Unknown,
@@ -36,19 +37,6 @@ impl DesktopCapability {
         Self::AutomaticPaste,
         Self::Tray,
     ];
-
-    /// Capabilities supplied by a platform adapter. `AutomaticPaste` is
-    /// derived from clipboard write, target restoration, and input.
-    pub const PROBED: [Self; 8] = [
-        Self::ClipboardRead,
-        Self::ClipboardWrite,
-        Self::Watcher,
-        Self::Shortcut,
-        Self::Pointer,
-        Self::TargetRestoration,
-        Self::Input,
-        Self::Tray,
-    ];
 }
 
 /// Stable, machine-readable reasons for an unavailable desktop integration.
@@ -77,19 +65,12 @@ impl CapabilityStatus {
     pub const fn unavailable(reason: CapabilityUnavailableReason) -> Self {
         Self::Unavailable { reason }
     }
-
-    fn from_probe(result: Result<(), CapabilityUnavailableReason>) -> Self {
-        match result {
-            Ok(()) => Self::Available,
-            Err(reason) => Self::Unavailable { reason },
-        }
-    }
 }
 
 /// Capability data safe to return across the application boundary.
 ///
 /// Native window, display, and input identifiers deliberately do not appear in
-/// this type. They are owned by the platform adapter that produced the probes.
+/// this type. Native integration modules retain those handles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopCapabilities {
@@ -188,22 +169,6 @@ fn automatic_paste_status(
     }
 }
 
-/// Boundary for platform integrations. Implementations retain all native
-/// handles; the domain receives only a success or stable failure reason.
-pub trait DesktopAdapter {
-    fn probe(&self, capability: DesktopCapability) -> Result<(), CapabilityUnavailableReason>;
-}
-
-/// Collect capability status without assuming an entire session is supported.
-pub fn detect_capabilities(
-    session: DesktopSession,
-    adapter: &impl DesktopAdapter,
-) -> DesktopCapabilities {
-    DesktopCapabilities::from_statuses(session, |capability| {
-        CapabilityStatus::from_probe(adapter.probe(capability))
-    })
-}
-
 trait Environment {
     fn variable(&self, name: &str) -> Option<String>;
 }
@@ -218,7 +183,11 @@ impl Environment for ProcessEnvironment {
 
 /// Detect the active display protocol from runtime session variables.
 pub fn detect_session() -> DesktopSession {
-    detect_session_from(&ProcessEnvironment)
+    if cfg!(target_os = "macos") {
+        DesktopSession::Macos
+    } else {
+        detect_session_from(&ProcessEnvironment)
+    }
 }
 
 fn detect_session_from(environment: &impl Environment) -> DesktopSession {
@@ -263,48 +232,6 @@ mod tests {
         }
     }
 
-    struct FakeAdapter {
-        results: HashMap<DesktopCapability, Result<(), CapabilityUnavailableReason>>,
-    }
-
-    impl FakeAdapter {
-        fn available() -> Self {
-            Self {
-                results: DesktopCapability::PROBED
-                    .into_iter()
-                    .map(|capability| (capability, Ok(())))
-                    .collect(),
-            }
-        }
-
-        fn unavailable(
-            mut self,
-            capability: DesktopCapability,
-            reason: CapabilityUnavailableReason,
-        ) -> Self {
-            self.results.insert(capability, Err(reason));
-            self
-        }
-
-        fn unavailable_all(reason: CapabilityUnavailableReason) -> Self {
-            Self {
-                results: DesktopCapability::PROBED
-                    .into_iter()
-                    .map(|capability| (capability, Err(reason)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl DesktopAdapter for FakeAdapter {
-        fn probe(&self, capability: DesktopCapability) -> Result<(), CapabilityUnavailableReason> {
-            self.results
-                .get(&capability)
-                .copied()
-                .expect("every capability has a fake probe result")
-        }
-    }
-
     #[test]
     fn detects_x11_from_explicit_runtime_session() {
         let environment = FakeEnvironment::with([("XDG_SESSION_TYPE", "x11")]);
@@ -341,99 +268,43 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_fully_available_session() {
-        let capabilities = detect_capabilities(DesktopSession::X11, &FakeAdapter::available());
-
-        assert_eq!(capabilities.session, DesktopSession::X11);
-        for capability in DesktopCapability::ALL {
-            assert_eq!(capabilities.status(capability), CapabilityStatus::Available);
-        }
-    }
-
-    #[test]
-    fn reports_partial_availability_without_inferencing_from_session() {
-        let adapter = FakeAdapter::available()
-            .unavailable(
-                DesktopCapability::Shortcut,
-                CapabilityUnavailableReason::InitializationFailed,
-            )
-            .unavailable(
-                DesktopCapability::Input,
-                CapabilityUnavailableReason::UnsupportedSession,
-            );
-
-        let capabilities = detect_capabilities(DesktopSession::Wayland, &adapter);
-
-        assert_eq!(capabilities.clipboard_read, CapabilityStatus::Available);
-        assert_eq!(
-            capabilities.shortcut,
-            CapabilityStatus::Unavailable {
-                reason: CapabilityUnavailableReason::InitializationFailed,
-            }
+    fn capability_report_derives_automatic_paste_from_required_integrations() {
+        let mut capabilities = DesktopCapabilities::unavailable(
+            DesktopSession::X11,
+            CapabilityUnavailableReason::AdapterUnavailable,
+        );
+        capabilities.set_status(
+            DesktopCapability::ClipboardWrite,
+            CapabilityStatus::Available,
+        );
+        capabilities.set_status(
+            DesktopCapability::TargetRestoration,
+            CapabilityStatus::Available,
         );
         assert_eq!(
             capabilities.automatic_paste,
-            CapabilityStatus::Unavailable {
-                reason: CapabilityUnavailableReason::UnsupportedSession,
-            }
+            CapabilityStatus::unavailable(CapabilityUnavailableReason::AdapterUnavailable)
         );
-        assert_eq!(capabilities.tray, CapabilityStatus::Available);
-    }
-
-    #[test]
-    fn reports_an_unknown_session_with_actionable_capability_reasons() {
-        let adapter = FakeAdapter::unavailable_all(CapabilityUnavailableReason::UnknownSession);
-
-        let capabilities = detect_capabilities(DesktopSession::Unknown, &adapter);
-
-        assert_eq!(capabilities.session, DesktopSession::Unknown);
-        assert_eq!(
-            capabilities.clipboard_read,
-            CapabilityStatus::Unavailable {
-                reason: CapabilityUnavailableReason::UnknownSession,
-            }
-        );
-        for capability in DesktopCapability::ALL {
-            assert_eq!(
-                capabilities.status(capability),
-                CapabilityStatus::Unavailable {
-                    reason: CapabilityUnavailableReason::UnknownSession,
-                }
-            );
-        }
+        capabilities.set_status(DesktopCapability::Input, CapabilityStatus::Available);
+        assert_eq!(capabilities.automatic_paste, CapabilityStatus::Available);
     }
 
     #[test]
     fn serializes_stable_capability_names_and_unavailable_reasons() {
-        let adapter = FakeAdapter::available().unavailable(
-            DesktopCapability::Watcher,
+        let mut capabilities = DesktopCapabilities::unavailable(
+            DesktopSession::X11,
             CapabilityUnavailableReason::AdapterUnavailable,
         );
-        let capabilities = detect_capabilities(DesktopSession::X11, &adapter);
+        capabilities.set_status(
+            DesktopCapability::ClipboardRead,
+            CapabilityStatus::Available,
+        );
         let value = serde_json::to_value(capabilities).expect("capabilities serialize");
-
         assert_eq!(value["clipboardRead"]["status"], json!("available"));
+        assert_eq!(value["watcher"]["reason"], json!("adapter_unavailable"));
         assert_eq!(
-            value["watcher"],
-            json!({
-                "status": "unavailable",
-                "reason": "adapter_unavailable",
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(CapabilityUnavailableReason::UnsupportedSession)
-                .expect("reason serializes"),
-            json!("unsupported_session")
-        );
-        assert_eq!(
-            serde_json::to_value(CapabilityUnavailableReason::UnknownSession)
-                .expect("reason serializes"),
+            serde_json::to_value(CapabilityUnavailableReason::UnknownSession).unwrap(),
             json!("unknown_session")
-        );
-        assert_eq!(
-            serde_json::to_value(CapabilityUnavailableReason::InitializationFailed)
-                .expect("reason serializes"),
-            json!("initialization_failed")
         );
     }
 }

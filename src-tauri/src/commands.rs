@@ -2,26 +2,23 @@ use std::vec::Vec;
 
 use log::{debug, error};
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
-use crate::clipboard::{ClipboardEventsEmitter, ClipboardItem, SystemClipboard};
+use crate::clipboard::ClipboardEventsEmitter;
+use crate::content::{HistorySummary, PasteContent};
 use crate::desktop::{DesktopCapabilities, DesktopCapability};
-use crate::input::simulate_paste_input;
 use crate::state::AppState;
-use crate::window::{get_main_window, restore_focused_window, show_settings_window};
+use crate::window::show_settings_window;
 use crate::{settings::ShortcutSettings, shortcuts};
 
 #[tauri::command]
-pub fn fetch_clipboard(state: State<'_, AppState>) -> Vec<ClipboardItem> {
-    let items = state
-        .clipboard
-        .list_for_display()
-        .unwrap_or_else(|error_value| {
-            error!(error:debug = error_value; "Failed to fetch clipboard history");
-            Vec::new()
-        });
+pub fn fetch_clipboard(state: State<'_, AppState>) -> Result<Vec<HistorySummary>, String> {
+    let items = state.clipboard.list_for_display().map_err(|error_value| {
+        error!(error:debug = error_value; "Failed to fetch clipboard history");
+        error_value.to_string()
+    })?;
     debug!(item_count = items.len(); "Fetched clipboard history");
-    items
+    Ok(items)
 }
 
 #[tauri::command]
@@ -59,14 +56,28 @@ pub fn save_shortcuts(
     let previous = active_shortcuts.clone();
     let native_shortcuts_available = state.capability_is_available(DesktopCapability::Shortcut);
 
-    save_shortcut_transaction(
+    let save_result = save_shortcut_transaction(
         native_shortcuts_available,
         &previous,
         &settings,
         || shortcuts::settings_path(&app).map_err(|error| error.to_string()),
         |active, requested| shortcuts::replace_global_shortcuts(&app, active, requested),
         |path, requested| crate::settings::save(path, requested),
-    )?;
+    );
+    if let Err(error_value) = save_result {
+        let previous_binding_missing = native_shortcuts_available
+            && previous.open_klipo != settings.open_klipo
+            && !shortcuts::binding_is_registered(&app, &previous).unwrap_or(false);
+        if previous_binding_missing {
+            state.set_capability(
+                DesktopCapability::Shortcut,
+                crate::desktop::CapabilityStatus::unavailable(
+                    crate::desktop::CapabilityUnavailableReason::InitializationFailed,
+                ),
+            );
+        }
+        return Err(error_value);
+    }
 
     *active_shortcuts = settings.clone();
 
@@ -82,14 +93,15 @@ fn save_shortcut_transaction<Destination>(
     persist: impl FnOnce(&Destination, &ShortcutSettings) -> Result<(), String>,
 ) -> Result<(), String> {
     let destination = prepare_persistence()?;
+    let runtime_change = replace_runtime && previous.open_klipo != next.open_klipo;
 
-    if replace_runtime {
+    if runtime_change {
         replace(previous, next)?;
     }
 
     match persist(&destination, next) {
         Ok(()) => Ok(()),
-        Err(error_value) if !replace_runtime => {
+        Err(error_value) if !runtime_change => {
             Err(format!("Could not save shortcut settings: {error_value}"))
         }
         Err(error_value) => match replace(next, previous) {
@@ -104,138 +116,24 @@ fn save_shortcut_transaction<Destination>(
 }
 
 #[tauri::command]
-pub fn clear(app: AppHandle, state: State<'_, AppState>) {
-    let clear_result = state.clipboard.clear();
-    if should_emit_clear_event(&clear_result) {
-        if let Err(error_value) = app.emit_clipboard_changed() {
-            error!(error:debug = error_value; "Failed to emit clipboard changed event");
-        }
-    } else if let Err(error_value) = clear_result {
-        error!(error:debug = error_value; "Failed to clear clipboard history");
+pub fn clear(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .clipboard
+        .clear()
+        .map_err(|error_value| error_value.to_string())?;
+    if let Err(error_value) = app.emit_clipboard_changed() {
+        error!(error:debug = error_value; "Failed to emit clipboard changed event");
     }
-}
-
-fn should_emit_clear_event(result: &Result<(), crate::storage::ClipboardError>) -> bool {
-    result.is_ok()
-}
-
-/// Write and verify a clipboard item's content before any paste side effects.
-pub(crate) fn write_to_clipboard(
-    system_clipboard: &SystemClipboard,
-    item: &ClipboardItem,
-) -> Result<(), crate::clipboard::SystemClipboardError> {
-    system_clipboard.write_item(item)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum PasteOutcome {
-    Pasted,
-    CopiedForManualPaste,
-    ClipboardWriteFailed,
-}
-
-trait PasteOperations {
-    fn item_for_hash(&self, hash: &str) -> Option<ClipboardItem>;
-    fn write_item(&self, item: &ClipboardItem) -> Result<(), String>;
-    fn move_to_top(&self, hash: &str) -> Result<(), String>;
-    fn restore_target(&self) -> Result<(), String>;
-    fn hide_picker(&self) -> Result<(), String>;
-    fn simulate_input(&self) -> Result<(), String>;
-}
-
-struct AppPasteOperations<'a> {
-    app: &'a AppHandle,
-    state: &'a AppState,
-}
-
-impl PasteOperations for AppPasteOperations<'_> {
-    fn item_for_hash(&self, hash: &str) -> Option<ClipboardItem> {
-        self.state.clipboard.get_by_hash(hash)
-    }
-
-    fn write_item(&self, item: &ClipboardItem) -> Result<(), String> {
-        let system_clipboard = self
-            .state
-            .system_clipboard
-            .as_ref()
-            .ok_or_else(|| "Clipboard write is unavailable".to_owned())?;
-
-        write_to_clipboard(system_clipboard, item).map_err(|error| error.to_string())
-    }
-
-    fn move_to_top(&self, hash: &str) -> Result<(), String> {
-        self.state
-            .clipboard
-            .move_to_top_by_hash(hash)
-            .map_err(|error| error.to_string())
-    }
-
-    fn restore_target(&self) -> Result<(), String> {
-        restore_focused_window(self.state).map_err(|error| error.to_string())
-    }
-
-    fn hide_picker(&self) -> Result<(), String> {
-        let window = get_main_window(self.app)
-            .ok_or_else(|| String::from("Main picker window unavailable"))?;
-        window.hide().map_err(|error| error.to_string())
-    }
-
-    fn simulate_input(&self) -> Result<(), String> {
-        let mut guard = self
-            .state
-            .input
-            .enigo
-            .lock()
-            .map_err(|_| "Input state is unavailable".to_string())?;
-        let enigo = guard
-            .as_mut()
-            .ok_or_else(|| "Input simulation is unavailable".to_string())?;
-
-        simulate_paste_input(enigo).map_err(|error| error.to_string())
-    }
-}
-
-fn paste_with(operations: &impl PasteOperations, hash: &str) -> PasteOutcome {
-    let Some(item) = operations.item_for_hash(hash) else {
-        return PasteOutcome::ClipboardWriteFailed;
-    };
-
-    if let Err(error_value) = operations.write_item(&item) {
-        error!(error:% = error_value; "Failed to write item to clipboard");
-        return PasteOutcome::ClipboardWriteFailed;
-    }
-
-    if let Err(error_value) = operations.move_to_top(hash) {
-        error!(error:% = error_value; "Failed to move copied item to the top");
-        return PasteOutcome::CopiedForManualPaste;
-    }
-
-    if let Err(error_value) = operations.restore_target() {
-        error!(error:% = error_value; "Failed to restore paste target");
-        return PasteOutcome::CopiedForManualPaste;
-    }
-
-    if let Err(error_value) = operations.hide_picker() {
-        error!(error:% = error_value; "Failed to hide picker before automatic paste");
-        return PasteOutcome::CopiedForManualPaste;
-    }
-
-    if let Err(error_value) = operations.simulate_input() {
-        error!(error:% = error_value; "Failed to simulate paste input");
-        return PasteOutcome::CopiedForManualPaste;
-    }
-
-    PasteOutcome::Pasted
+    Ok(())
 }
 
 #[tauri::command]
-pub fn paste(app: AppHandle, state: State<'_, AppState>, hash: &str) -> PasteOutcome {
-    let operations = AppPasteOperations {
-        app: &app,
-        state: &state,
-    };
-
-    paste_with(&operations, hash)
+pub fn paste(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    hash: &str,
+) -> Result<crate::picker::PasteOutcome, String> {
+    crate::picker::paste(&app, &state, hash)
 }
 
 #[tauri::command]
@@ -248,69 +146,89 @@ pub(crate) fn exit_application(app: &AppHandle) {
 }
 
 #[tauri::command]
-pub fn show_settings(app: AppHandle) {
-    if let Err(error_value) = show_settings_window(&app) {
-        error!(error:debug = error_value; "Failed to show settings");
-    }
+pub fn show_settings(app: AppHandle) -> Result<(), String> {
+    show_settings_window(&app).map_err(|error_value| error_value.to_string())
 }
 
 #[tauri::command]
-pub fn close(app: AppHandle, state: State<'_, AppState>) {
-    let Some(window) = get_main_window(&app) else {
-        error!("Failed to get main window");
-        return;
-    };
-
-    if let Err(error_value) = window.hide() {
-        error!(error:debug = error_value; "Failed to hide window");
-    }
-
-    if let Err(error_value) = restore_focused_window(&state) {
-        error!(error:debug = error_value; "Failed to restore focus");
-    }
+pub fn close_settings(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("settings")
+        .ok_or("Settings window unavailable")?;
+    window.hide().map_err(|error_value| error_value.to_string())
 }
 
 #[tauri::command]
-pub fn delete_item(app: AppHandle, state: State<'_, AppState>, hash: &str) {
+pub fn close(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    crate::picker::close(&app, &state)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DeleteOutcome {
+    Deleted,
+    DeletedWithClipboardWarning,
+}
+
+#[tauri::command]
+pub fn delete_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    hash: &str,
+) -> Result<DeleteOutcome, String> {
     if hash.is_empty() {
-        return;
+        return Err("Clipboard item identity is empty".into());
     }
 
-    let Ok(item_idx) = state.clipboard.delete_by_hash(hash) else {
-        error!("Failed to delete item from clipboard history");
-        return;
-    };
+    let item_idx = state
+        .clipboard
+        .delete_by_hash(hash)
+        .map_err(|error_value| error_value.to_string())?;
 
     if let Err(error_value) = app.emit_clipboard_changed() {
         error!(error:debug = error_value; "Failed to emit clipboard changed event");
     }
 
     if item_idx == 0 {
-        if let Some(item) = state.clipboard.first() {
+        let first_hash = match state.clipboard.first_hash() {
+            Ok(first_hash) => first_hash,
+            Err(error_value) => {
+                error!(error:debug = error_value; "Failed to find the next clipboard item");
+                return Ok(DeleteOutcome::DeletedWithClipboardWarning);
+            }
+        };
+        if let Some(first_hash) = first_hash {
+            let item = match state.clipboard.load_for_paste(&first_hash) {
+                Ok(item) => item,
+                Err(crate::storage::ClipboardError::ImageUnavailable {
+                    fallback_text: Some(text),
+                }) => PasteContent::Text(text),
+                Err(error_value) => {
+                    error!(error:debug = error_value; "Failed to load the next clipboard item");
+                    return Ok(DeleteOutcome::DeletedWithClipboardWarning);
+                }
+            };
             let Some(system_clipboard) = state.system_clipboard.as_ref() else {
                 error!(capability = "clipboard_write", failure_category = "adapter_unavailable"; "Clipboard write is unavailable");
-                return;
+                return Ok(DeleteOutcome::DeletedWithClipboardWarning);
             };
 
-            if let Err(error_value) = write_to_clipboard(system_clipboard, &item) {
+            if let Err(error_value) = system_clipboard.write_content(&item) {
                 error!(error:debug = error_value; "Failed to write first item to clipboard");
+                return Ok(DeleteOutcome::DeletedWithClipboardWarning);
             }
         }
     }
+    Ok(DeleteOutcome::Deleted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        paste_with, save_shortcut_transaction, should_emit_clear_event, PasteOperations,
-        PasteOutcome,
-    };
-    use crate::clipboard::ClipboardItem;
+    use super::save_shortcut_transaction;
+    use crate::content::PasteContent;
+    use crate::picker::{paste_with, PasteOperations, PasteOutcome};
     use crate::settings::ShortcutSettings;
-    use crate::storage::ClipboardError;
 
     struct FakePasteOperations {
-        item: Option<ClipboardItem>,
         write_result: Result<(), String>,
         reorder_result: Result<(), String>,
         restore_result: Result<(), String>,
@@ -322,12 +240,6 @@ mod tests {
     impl FakePasteOperations {
         fn successful() -> Self {
             Self {
-                item: Some(ClipboardItem {
-                    text: "copied text".into(),
-                    hash: "text:known".into(),
-                    image: None,
-                    preview: None,
-                }),
                 write_result: Ok(()),
                 reorder_result: Ok(()),
                 restore_result: Ok(()),
@@ -347,11 +259,7 @@ mod tests {
     }
 
     impl PasteOperations for FakePasteOperations {
-        fn item_for_hash(&self, _hash: &str) -> Option<ClipboardItem> {
-            self.item.clone()
-        }
-
-        fn write_item(&self, _item: &ClipboardItem) -> Result<(), String> {
+        fn write_item(&self, _item: &PasteContent) -> Result<(), String> {
             self.events.borrow_mut().push("write");
             self.write_result.clone()
         }
@@ -382,19 +290,17 @@ mod tests {
         operations.input_result = FakePasteOperations::failed(error);
 
         assert_eq!(
-            paste_with(&operations, "text:known"),
-            PasteOutcome::CopiedForManualPaste
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::CopiedForManualPaste)
         );
         assert_eq!(
             operations.events(),
             ["write", "reorder", "restore", "hide", "input"]
         );
-    }
-
-    #[test]
-    fn clear_event_is_emitted_only_after_a_committed_clear() {
-        assert!(should_emit_clear_event(&Ok(())));
-        assert!(!should_emit_clear_event(&Err(ClipboardError::ItemNotFound)));
     }
 
     #[test]
@@ -423,10 +329,35 @@ mod tests {
     }
 
     #[test]
+    fn changing_only_picker_shortcuts_does_not_replace_the_global_binding() {
+        let previous = ShortcutSettings::default();
+        let mut next = previous.clone();
+        next.move_selection_up = "KeyW".into();
+        let mut replacements = 0;
+
+        let saved = save_shortcut_transaction(
+            true,
+            &previous,
+            &next,
+            || Ok(()),
+            |_, _| {
+                replacements += 1;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        );
+
+        assert!(saved.is_ok());
+        assert_eq!(replacements, 0);
+    }
+
+    #[test]
     fn persistence_failure_restores_the_previous_runtime_binding() {
         let previous = ShortcutSettings::default();
-        let mut next = ShortcutSettings::default();
-        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let next = ShortcutSettings {
+            open_klipo: "SUPER+ALT+KeyK".into(),
+            ..ShortcutSettings::default()
+        };
         let mut replacements = Vec::new();
 
         let error_value = save_shortcut_transaction(
@@ -455,8 +386,10 @@ mod tests {
     #[test]
     fn failed_persistence_preparation_leaves_the_runtime_binding_unchanged() {
         let previous = ShortcutSettings::default();
-        let mut next = ShortcutSettings::default();
-        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let next = ShortcutSettings {
+            open_klipo: "SUPER+ALT+KeyK".into(),
+            ..ShortcutSettings::default()
+        };
         let mut replacement_attempted = false;
 
         let error_value = save_shortcut_transaction(
@@ -479,8 +412,10 @@ mod tests {
     #[test]
     fn persistence_failure_reports_when_the_inverse_runtime_replacement_also_fails() {
         let previous = ShortcutSettings::default();
-        let mut next = ShortcutSettings::default();
-        next.open_klipo = "SUPER+ALT+KeyK".into();
+        let next = ShortcutSettings {
+            open_klipo: "SUPER+ALT+KeyK".into(),
+            ..ShortcutSettings::default()
+        };
         let mut replacements = Vec::new();
 
         let error_value = save_shortcut_transaction(
@@ -521,22 +456,6 @@ mod tests {
             serde_json::to_value(PasteOutcome::CopiedForManualPaste).unwrap(),
             serde_json::json!("CopiedForManualPaste")
         );
-        assert_eq!(
-            serde_json::to_value(PasteOutcome::ClipboardWriteFailed).unwrap(),
-            serde_json::json!("ClipboardWriteFailed")
-        );
-    }
-
-    #[test]
-    fn unknown_hash_does_not_change_history_or_picker() {
-        let mut operations = FakePasteOperations::successful();
-        operations.item = None;
-
-        assert_eq!(
-            paste_with(&operations, "text:unknown"),
-            PasteOutcome::ClipboardWriteFailed
-        );
-        assert!(operations.events().is_empty());
     }
 
     #[test]
@@ -545,8 +464,12 @@ mod tests {
         operations.write_result = FakePasteOperations::failed("write");
 
         assert_eq!(
-            paste_with(&operations, "text:known"),
-            PasteOutcome::ClipboardWriteFailed
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Err("write".into())
         );
         assert_eq!(operations.events(), ["write"]);
     }
@@ -555,7 +478,14 @@ mod tests {
     fn successful_paste_writes_reorders_restores_hides_then_inputs() {
         let operations = FakePasteOperations::successful();
 
-        assert_eq!(paste_with(&operations, "text:known"), PasteOutcome::Pasted);
+        assert_eq!(
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::Pasted)
+        );
         assert_eq!(
             operations.events(),
             ["write", "reorder", "restore", "hide", "input"]
@@ -568,8 +498,12 @@ mod tests {
         operations.reorder_result = FakePasteOperations::failed("reorder");
 
         assert_eq!(
-            paste_with(&operations, "text:known"),
-            PasteOutcome::CopiedForManualPaste
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::CopiedForManualPaste)
         );
         assert_eq!(operations.events(), ["write", "reorder"]);
     }
@@ -580,8 +514,12 @@ mod tests {
         operations.restore_result = FakePasteOperations::failed("target unavailable");
 
         assert_eq!(
-            paste_with(&operations, "text:known"),
-            PasteOutcome::CopiedForManualPaste
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::CopiedForManualPaste)
         );
         assert_eq!(operations.events(), ["write", "reorder", "restore"]);
     }
@@ -592,8 +530,12 @@ mod tests {
         operations.hide_result = FakePasteOperations::failed("hide");
 
         assert_eq!(
-            paste_with(&operations, "text:known"),
-            PasteOutcome::CopiedForManualPaste
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::CopiedForManualPaste)
         );
         assert_eq!(operations.events(), ["write", "reorder", "restore", "hide"]);
     }

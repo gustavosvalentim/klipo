@@ -5,36 +5,6 @@ export type ListItemProps = {
 	preview?: string;
 };
 
-type ListItemButtonProps = React.PropsWithChildren & {
-	className?: string;
-	onClick?: () => void;
-	active?: boolean;
-};
-
-const ListItemButtonStyle =
-	"list-item__button flex-1 min-w-0 h-[24px] border-0 rounded-sm text-left overflow-hidden";
-
-const ActiveListItemButtonStyle = "is-active";
-
-const ListItemButton = ({
-	onClick,
-	active,
-	className,
-	...props
-}: ListItemButtonProps) => {
-	const buttonStyle = [ListItemButtonStyle, className];
-
-	if (active) {
-		buttonStyle.push(ActiveListItemButtonStyle);
-	}
-
-	return (
-		<button className={buttonStyle.join(" ")} onClick={onClick} {...props}>
-			{props.children}
-		</button>
-	);
-};
-
 export const ListItem = ({
 	label,
 	onClick,
@@ -43,10 +13,10 @@ export const ListItem = ({
 	...props
 }: ListItemProps) => (
 	<div className="flex w-full items-center my-1">
-		<ListItemButton
+		<button
+			type="button"
 			onClick={onClick}
-			className="px-2"
-			active={active}
+			className={`list-item__button flex-1 min-w-0 h-[24px] border-0 rounded-sm text-left overflow-hidden px-2${active ? " is-active" : ""}`}
 			{...props}
 		>
 			{preview ? (
@@ -60,6 +30,6 @@ export const ListItem = ({
 					{label}
 				</span>
 			)}
-		</ListItemButton>
+		</button>
 	</div>
 );

@@ -11,7 +11,7 @@ Klipo is a macOS clipboard manager built with Tauri, React, TypeScript, and Rust
 - Menu bar resident mode
 - Rotating JSON diagnostic logs
 
-Klipo currently supports macOS only. Linux and Windows support are not implemented.
+Klipo supports macOS and has an existing Linux X11/Wayland implementation. X11 supports global shortcuts and automatic paste when native integrations are available. Wayland uses manual paste and has watcher limitations. Windows support is not implemented.
 
 ### X11 clipboard ownership
 
@@ -46,8 +46,8 @@ The X11 implementation has protocol-level unit tests, but native acceptance on U
 8. Restart Klipo.
 
 Accessibility permission is required to paste into the previously active application. If Klipo
-cannot activate that application or simulate the paste shortcut, it keeps the picker available and
-reports that the item was copied so you can paste it manually.
+cannot activate that application or simulate the paste shortcut, it attempts to restore the picker and
+reports that the item was copied so you can paste it manually. Recovery failures are reported separately.
 
 ## Usage
 
@@ -63,10 +63,9 @@ Open **Settings** from the menu bar to change the picker shortcuts. Only the sho
 
 Requirements:
 
-- macOS
+- macOS or Linux with the Tauri system dependencies
 - Rust and Cargo
 - Bun
-- Tauri development dependencies for macOS
 
 ```sh
 bun install
@@ -90,10 +89,13 @@ Validate the frontend before opening a pull request:
 ```sh
 bun install --frozen-lockfile
 bun run --no-install biome check
+bun run test
 bun run build
 ```
 
-There is currently no frontend test command or Vitest test suite configured, so the frontend CI runs the checks above. Add a test command and test suite before enabling frontend tests in CI.
+Frontend behavior is tested with Vitest. Rust unit tests run with `cargo test --manifest-path src-tauri/Cargo.toml`. Passing unit tests does not establish native desktop acceptance; the Linux checks use Xvfb, and manual macOS/X11/Wayland acceptance remains separate.
+
+As of 2026-10-02, a macOS ARM64 Tauri release binary builds successfully. Interactive macOS picker/paste acceptance and native Ubuntu Xorg/Wayland acceptance for the architecture simplification remain outstanding.
 
 Format the project:
 

@@ -5,7 +5,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager};
 
-use crate::window::{show_picker_window, show_settings_window};
+use crate::window::show_settings_window;
 
 const OPEN_PICKER_MENU_ID: &str = "open-picker";
 const SETTINGS_MENU_ID: &str = "settings";
@@ -57,63 +57,12 @@ pub fn remove(app: &AppHandle) {
     }
 }
 
-pub(crate) fn construct_and_retain<T, E>(
-    construct: impl FnOnce() -> Result<T, E>,
-    retain: impl FnOnce(T),
-) -> Result<(), E> {
-    match construct() {
-        Ok(resource) => {
-            retain(resource);
-            Ok(())
-        }
-        Err(error_value) => Err(error_value),
-    }
-}
-
 fn menu_action(menu_id: &str) -> Option<TrayMenuAction> {
     match menu_id {
         OPEN_PICKER_MENU_ID => Some(TrayMenuAction::OpenPicker),
         SETTINGS_MENU_ID => Some(TrayMenuAction::Settings),
         QUIT_MENU_ID => Some(TrayMenuAction::Quit),
         _ => None,
-    }
-}
-
-trait TrayMenuOperations {
-    fn open_picker(&self) -> Result<(), String>;
-    fn show_settings(&self) -> Result<(), String>;
-    fn quit(&self);
-}
-
-struct AppTrayMenuOperations<'a> {
-    app: &'a AppHandle,
-}
-
-impl TrayMenuOperations for AppTrayMenuOperations<'_> {
-    fn open_picker(&self) -> Result<(), String> {
-        show_picker_window(self.app).map_err(|error_value| error_value.to_string())
-    }
-
-    fn show_settings(&self) -> Result<(), String> {
-        show_settings_window(self.app).map_err(|error_value| error_value.to_string())
-    }
-
-    fn quit(&self) {
-        crate::commands::exit_application(self.app);
-    }
-}
-
-fn execute_menu_action(
-    operations: &impl TrayMenuOperations,
-    action: TrayMenuAction,
-) -> Result<(), String> {
-    match action {
-        TrayMenuAction::OpenPicker => operations.open_picker(),
-        TrayMenuAction::Settings => operations.show_settings(),
-        TrayMenuAction::Quit => {
-            operations.quit();
-            Ok(())
-        }
     }
 }
 
@@ -146,27 +95,28 @@ fn remove_tray<T>(manager: &impl TrayManager, retained_tray: &Mutex<Option<T>>) 
 }
 
 fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
-    if let Some(action) = menu_action(event.id.as_ref()) {
-        let operations = AppTrayMenuOperations { app };
-
-        if let Err(error_value) = execute_menu_action(&operations, action) {
-            error!(action:? = action, error:% = error_value; "Failed to handle tray menu action");
+    let action = menu_action(event.id.as_ref());
+    let action_result = match action {
+        Some(TrayMenuAction::OpenPicker) => crate::picker::open(app),
+        Some(TrayMenuAction::Settings) => {
+            show_settings_window(app).map_err(|error_value| error_value.to_string())
         }
+        Some(TrayMenuAction::Quit) => {
+            crate::commands::exit_application(app);
+            Ok(())
+        }
+        None => Ok(()),
+    };
+    if let Err(error_value) = action_result {
+        error!(action:? = action, error:% = error_value; "Failed to handle tray menu action");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
 
     use super::*;
-
-    struct FakeTrayMenuOperations {
-        actions: RefCell<Vec<TrayMenuAction>>,
-        open_picker_result: Result<(), String>,
-        settings_result: Result<(), String>,
-        quit_called: Cell<bool>,
-    }
 
     struct FakeTrayManager<'a> {
         events: &'a RefCell<Vec<&'static str>>,
@@ -187,57 +137,6 @@ mod tests {
         fn drop(&mut self) {
             self.events.borrow_mut().push("retained tray");
         }
-    }
-
-    impl Default for FakeTrayMenuOperations {
-        fn default() -> Self {
-            Self {
-                actions: RefCell::new(Vec::new()),
-                open_picker_result: Ok(()),
-                settings_result: Ok(()),
-                quit_called: Cell::new(false),
-            }
-        }
-    }
-
-    impl TrayMenuOperations for FakeTrayMenuOperations {
-        fn open_picker(&self) -> Result<(), String> {
-            self.actions.borrow_mut().push(TrayMenuAction::OpenPicker);
-            self.open_picker_result.clone()
-        }
-
-        fn show_settings(&self) -> Result<(), String> {
-            self.actions.borrow_mut().push(TrayMenuAction::Settings);
-            self.settings_result.clone()
-        }
-
-        fn quit(&self) {
-            self.actions.borrow_mut().push(TrayMenuAction::Quit);
-            self.quit_called.set(true);
-        }
-    }
-
-    #[test]
-    fn retains_a_successfully_constructed_tray() {
-        let retained = Cell::new(None);
-
-        let result = construct_and_retain(|| Ok::<_, &str>(42), |tray| retained.set(Some(tray)));
-
-        assert_eq!(result, Ok(()));
-        assert_eq!(retained.get(), Some(42));
-    }
-
-    #[test]
-    fn does_not_retain_a_failed_tray_construction() {
-        let retained = Cell::new(false);
-
-        let result = construct_and_retain(
-            || Err::<(), _>("tray host unavailable"),
-            |_| retained.set(true),
-        );
-
-        assert_eq!(result, Err("tray host unavailable"));
-        assert!(!retained.get());
     }
 
     #[test]
@@ -267,46 +166,5 @@ mod tests {
         );
         assert_eq!(menu_action(QUIT_MENU_ID), Some(TrayMenuAction::Quit));
         assert_eq!(menu_action("unknown"), None);
-    }
-
-    #[test]
-    fn runs_open_picker_settings_and_quit_actions() {
-        let operations = FakeTrayMenuOperations::default();
-
-        assert_eq!(
-            execute_menu_action(&operations, TrayMenuAction::OpenPicker),
-            Ok(())
-        );
-        assert_eq!(
-            execute_menu_action(&operations, TrayMenuAction::Settings),
-            Ok(())
-        );
-        assert_eq!(
-            execute_menu_action(&operations, TrayMenuAction::Quit),
-            Ok(())
-        );
-
-        assert_eq!(
-            operations.actions.into_inner(),
-            vec![
-                TrayMenuAction::OpenPicker,
-                TrayMenuAction::Settings,
-                TrayMenuAction::Quit,
-            ]
-        );
-        assert!(operations.quit_called.get());
-    }
-
-    #[test]
-    fn returns_action_errors_without_running_quit() {
-        let operations = FakeTrayMenuOperations {
-            open_picker_result: Err("picker unavailable".into()),
-            ..Default::default()
-        };
-
-        let result = execute_menu_action(&operations, TrayMenuAction::OpenPicker);
-
-        assert_eq!(result, Err("picker unavailable".into()));
-        assert!(!operations.quit_called.get());
     }
 }

@@ -8,6 +8,7 @@ on:
       - "bun.lock"
       - "biome.json"
       - "vite.config.ts"
+      - "vitest.config.ts"
       - "tsconfig.json"
       - "tsconfig.node.json"
       - "index.html"
@@ -33,6 +34,9 @@ jobs:
 
       - name: Check formatting and linting
         run: bun run --no-install biome check
+
+      - name: Run frontend tests
+        run: bun run test
 
       - name: Build the frontend
         run: bun run build
