@@ -68,15 +68,16 @@ export function SettingsView() {
 			});
 		};
 		const record = (event: KeyboardEvent) => {
-			event.preventDefault();
-			event.stopPropagation();
-			if (saving.current) return;
 			if (event.key === "Escape") {
+				event.preventDefault();
+				event.stopPropagation();
 				setRecording(null);
 				closeSettings();
 				return;
 			}
-			if (!recording) return;
+			if (saving.current || !recording) return;
+			event.preventDefault();
+			event.stopPropagation();
 			const shortcut = shortcutFromEvent(event);
 			if (!shortcut) {
 				setError("Escape and modifier-only shortcuts cannot be used.");
@@ -143,6 +144,7 @@ export function SettingsView() {
 					<span>{label}</span>
 					<button
 						type="button"
+						disabled={isSaving}
 						className={
 							recording === field
 								? "settings__shortcut is-recording"
