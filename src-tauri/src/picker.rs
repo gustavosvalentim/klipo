@@ -57,17 +57,35 @@ pub fn open(app: &tauri::AppHandle) -> Result<(), String> {
 
 pub fn recover(app: &tauri::AppHandle, generation: u64) -> Result<(), String> {
     let state = app.state::<AppState>();
-    if !state.picker_session_is_current(generation) {
-        return Err("Picker session was dismissed".into());
-    }
-    let window = get_main_window(app).ok_or("Picker window unavailable")?;
-    window.show().map_err(|error| error.to_string())?;
-    if !state.picker_session_is_current(generation) {
-        return Err("Picker session was dismissed".into());
-    }
-    window.set_focus().map_err(|error| error.to_string())?;
+    recover_with(
+        &state,
+        generation,
+        || get_main_window(app).ok_or_else(|| "Picker window unavailable".into()),
+        |window| window.show().map_err(|error| error.to_string()),
+        |window| window.set_focus().map_err(|error| error.to_string()),
+    )
+}
+
+fn recover_with<Window>(
+    state: &AppState,
+    generation: u64,
+    get_window: impl FnOnce() -> Result<Window, String>,
+    show_window: impl FnOnce(&Window) -> Result<(), String>,
+    focus_window: impl FnOnce(&Window) -> Result<(), String>,
+) -> Result<(), String> {
+    let recovery = (|| {
+        if !state.picker_session_is_current(generation) {
+            return Err("Picker session was dismissed".into());
+        }
+        let window = get_window()?;
+        show_window(&window)?;
+        if !state.picker_session_is_current(generation) {
+            return Err("Picker session was dismissed".into());
+        }
+        focus_window(&window)
+    })();
     state.expect_paste_focus_loss(false);
-    Ok(())
+    recovery
 }
 
 fn should_capture_focus_target<FocusError>(picker_is_focused: &Result<bool, FocusError>) -> bool {
@@ -411,6 +429,55 @@ mod tests {
         assert!(should_capture_focus_target(&Ok::<bool, ()>(false)));
         assert!(!should_capture_focus_target(&Ok::<bool, ()>(true)));
         assert!(!should_capture_focus_target(&Err::<bool, ()>(())));
+    }
+
+    #[test]
+    fn failed_recovery_always_clears_expected_focus_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            directory.path().join("history.sqlite3"),
+            crate::desktop::DesktopSession::Macos,
+        )
+        .unwrap();
+        let generation = state.next_picker_session();
+
+        for failing_step in ["window", "show", "focus"] {
+            state.expect_paste_focus_loss(true);
+            let recovery = recover_with(
+                &state,
+                generation,
+                || {
+                    if failing_step == "window" {
+                        Err("window unavailable".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    if failing_step == "show" {
+                        Err("show failed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    if failing_step == "focus" {
+                        Err("focus failed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert!(recovery.is_err(), "{failing_step} should fail recovery");
+            assert!(!state.paste_focus_loss_expected());
+        }
+
+        state.dismiss_picker_session();
+        state.expect_paste_focus_loss(true);
+        let stale_recovery = recover_with(&state, generation, || Ok(()), |_| Ok(()), |_| Ok(()));
+        assert!(stale_recovery.is_err());
+        assert!(!state.paste_focus_loss_expected());
     }
 
     fn monitor(

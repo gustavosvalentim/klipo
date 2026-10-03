@@ -82,4 +82,20 @@ describe("SettingsView", () => {
 			expect(mocks.invoke).toHaveBeenCalledWith("close_settings"),
 		);
 	});
+
+	it("leaves keyboard navigation and button activation available outside recording", async () => {
+		render(<SettingsView />);
+		const shortcut = await screen.findByText("ArrowUp");
+
+		expect(fireEvent.keyDown(shortcut, { key: "Tab", code: "Tab" })).toBe(true);
+		expect(fireEvent.keyDown(shortcut, { key: "Enter", code: "Enter" })).toBe(
+			true,
+		);
+
+		fireEvent.click(shortcut);
+		expect(fireEvent.keyDown(window, { key: "w", code: "KeyW" })).toBe(false);
+		await screen.findByText("W");
+		const save = screen.getByRole("button", { name: "Save changes" });
+		expect(fireEvent.keyDown(save, { key: " ", code: "Space" })).toBe(true);
+	});
 });
