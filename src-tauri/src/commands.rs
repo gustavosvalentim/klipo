@@ -225,10 +225,11 @@ pub fn delete_item(
 mod tests {
     use super::save_shortcut_transaction;
     use crate::content::PasteContent;
-    use crate::picker::{paste_with, PasteOperations, PasteOutcome};
+    use crate::picker::{paste_with, resolve_and_paste_with, PasteOperations, PasteOutcome};
     use crate::settings::ShortcutSettings;
 
     struct FakePasteOperations {
+        automatic_paste_available: bool,
         write_result: Result<(), String>,
         reorder_result: Result<(), String>,
         restore_result: Result<(), String>,
@@ -240,6 +241,7 @@ mod tests {
     impl FakePasteOperations {
         fn successful() -> Self {
             Self {
+                automatic_paste_available: true,
                 write_result: Ok(()),
                 reorder_result: Ok(()),
                 restore_result: Ok(()),
@@ -259,6 +261,10 @@ mod tests {
     }
 
     impl PasteOperations for FakePasteOperations {
+        fn automatic_paste_available(&self) -> bool {
+            self.automatic_paste_available
+        }
+
         fn write_item(&self, _item: &PasteContent) -> Result<(), String> {
             self.events.borrow_mut().push("write");
             self.write_result.clone()
@@ -449,6 +455,10 @@ mod tests {
     #[test]
     fn paste_outcomes_serialize_as_the_frontend_contract() {
         assert_eq!(
+            serde_json::to_value(PasteOutcome::ClipboardWriteFailed).unwrap(),
+            serde_json::json!("ClipboardWriteFailed")
+        );
+        assert_eq!(
             serde_json::to_value(PasteOutcome::Pasted).unwrap(),
             serde_json::json!("Pasted")
         );
@@ -456,6 +466,66 @@ mod tests {
             serde_json::to_value(PasteOutcome::CopiedForManualPaste).unwrap(),
             serde_json::json!("CopiedForManualPaste")
         );
+    }
+
+    #[test]
+    fn unknown_or_stale_hash_has_no_paste_side_effects() {
+        let operations = FakePasteOperations::successful();
+
+        let outcome =
+            resolve_and_paste_with(&operations, "text:unknown", || Err("Item not found".into()));
+
+        assert_eq!(outcome, Err("Item not found".into()));
+        assert!(operations.events().is_empty());
+    }
+
+    #[test]
+    fn resolves_content_before_any_paste_operation() {
+        let operations = FakePasteOperations::successful();
+
+        let outcome = resolve_and_paste_with(&operations, "text:known", || {
+            operations.events.borrow_mut().push("resolve");
+            Ok(PasteContent::Text("copied text".into()))
+        });
+
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            operations.events(),
+            ["resolve", "write", "reorder", "restore", "hide", "input"]
+        );
+    }
+
+    #[test]
+    fn manual_only_transaction_writes_and_reorders_without_target_or_input_operations() {
+        let mut operations = FakePasteOperations::successful();
+        operations.automatic_paste_available = false;
+
+        assert_eq!(
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::CopiedForManualPaste)
+        );
+        assert_eq!(operations.events(), ["write", "reorder"]);
+    }
+
+    #[test]
+    fn manual_only_write_failure_has_no_later_side_effects() {
+        let mut operations = FakePasteOperations::successful();
+        operations.automatic_paste_available = false;
+        operations.write_result = FakePasteOperations::failed("verification");
+
+        assert_eq!(
+            paste_with(
+                &operations,
+                "text:known",
+                &PasteContent::Text("copied text".into())
+            ),
+            Ok(PasteOutcome::ClipboardWriteFailed)
+        );
+        assert_eq!(operations.events(), ["write"]);
     }
 
     #[test]
@@ -469,7 +539,7 @@ mod tests {
                 "text:known",
                 &PasteContent::Text("copied text".into())
             ),
-            Err("write".into())
+            Ok(PasteOutcome::ClipboardWriteFailed)
         );
         assert_eq!(operations.events(), ["write"]);
     }

@@ -14,7 +14,7 @@ import { SettingsView } from "./SettingsView";
 import { type ShortcutSettings, shortcutFromEvent } from "./shortcuts";
 import "./App.css";
 
-type PasteOutcome = "Pasted" | "CopiedForManualPaste";
+type PasteOutcome = "Pasted" | "CopiedForManualPaste" | "ClipboardWriteFailed";
 
 function isInteractiveTarget(target: EventTarget | null) {
 	return (
@@ -93,17 +93,19 @@ export function App() {
 	}, [invalidatePasteRequest, refreshHistory, setHistoryError]);
 
 	const showSettings = useCallback(() => {
+		invalidatePasteRequest();
 		void invoke("show_settings").catch((error) => {
 			logError("Failed to show settings", error);
 			setHistoryError(String(error));
 		});
-	}, [setHistoryError]);
+	}, [invalidatePasteRequest, setHistoryError]);
 
 	const quitApplication = useCallback(() => {
+		invalidatePasteRequest();
 		void invoke("quit").catch((error) =>
 			logError("Failed to quit Klipo", error),
 		);
-	}, []);
+	}, [invalidatePasteRequest]);
 
 	const pasteFromSelection = useCallback(
 		async (hash: string) => {
@@ -113,6 +115,9 @@ export function App() {
 				const outcome = await invoke<PasteOutcome>("paste", { hash });
 				if (request !== pasteRequest.current) return;
 				if (outcome === "CopiedForManualPaste") setManualPasteCopied(true);
+				if (outcome === "ClipboardWriteFailed") {
+					setHistoryError("Could not copy this item.");
+				}
 			} catch (reason) {
 				logError("Failed to paste from selection", reason);
 				if (request === pasteRequest.current) {
@@ -224,7 +229,6 @@ export function App() {
 
 	const handleBlur = useCallback(() => {
 		setSelectedHash(null);
-		setManualPasteCopied(false);
 	}, [setSelectedHash]);
 
 	const handleFocus = useCallback(() => {

@@ -188,6 +188,32 @@ mod tests {
     }
 
     #[test]
+    fn paste_input_failure_matrix_covers_control_and_meta() {
+        for modifier in [Key::Control, Key::Meta] {
+            for failed_step in [None, Some(0), Some(1), Some(2)] {
+                let input_results = (0..3).map(|step| {
+                    if failed_step == Some(step) {
+                        Err(input_error("injected failure"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                let mut input = FakeKeyInput::new(input_results);
+
+                let outcome = simulate_paste_input_with(&mut input, modifier);
+                let expected = if failed_step == Some(0) {
+                    vec![(modifier, Direction::Press)]
+                } else {
+                    expected_calls(modifier)
+                };
+
+                assert_eq!(outcome.is_ok(), failed_step.is_none());
+                assert_eq!(input.calls, expected);
+            }
+        }
+    }
+
+    #[test]
     fn limits_linux_input_to_x11_but_preserves_macos_support() {
         assert!(supports_input(DesktopSession::X11));
         assert!(!supports_input(DesktopSession::Wayland));
