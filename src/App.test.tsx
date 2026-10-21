@@ -110,6 +110,32 @@ describe("App", () => {
 	});
 
 	it.each([
+		"ArrowDown",
+		"Escape",
+	])("clears Copied feedback on the next %s action", async (key) => {
+		const item = await renderPicker();
+		fireEvent.click(item);
+		await screen.findByRole("status");
+
+		fireEvent.keyDown(window, { key, code: key });
+
+		expect(screen.queryByRole("status")).toBeNull();
+	});
+
+	it.each([
+		"Settings",
+		"Quit",
+	])("clears Copied feedback when activating %s", async (name) => {
+		const item = await renderPicker();
+		fireEvent.click(item);
+		await screen.findByRole("status");
+
+		fireEvent.click(screen.getByRole("button", { name }));
+
+		expect(screen.queryByRole("status")).toBeNull();
+	});
+
+	it.each([
 		"Pasted",
 	])("does not change picker presentation for %s", async (outcome) => {
 		configurePaste(() => Promise.resolve(outcome));
@@ -119,6 +145,22 @@ describe("App", () => {
 		await nextTick();
 
 		expect(screen.queryByRole("status")).toBeNull();
+		expect(mocks.currentWindow.show).not.toHaveBeenCalled();
+		expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
+	});
+
+	it("shows a structured clipboard write failure without closing the picker", async () => {
+		configurePaste(() => Promise.resolve("ClipboardWriteFailed"));
+		const item = await renderPicker();
+		fireEvent.click(item);
+
+		await waitFor(() =>
+			expect(screen.getByRole("alert").textContent).toBe(
+				"Could not copy this item.",
+			),
+		);
+		expect(screen.queryByRole("status")).toBeNull();
+		expect(mocks.invoke).not.toHaveBeenCalledWith("close");
 		expect(mocks.currentWindow.show).not.toHaveBeenCalled();
 		expect(mocks.currentWindow.setFocus).not.toHaveBeenCalled();
 	});

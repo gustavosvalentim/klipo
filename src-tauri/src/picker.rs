@@ -242,9 +242,11 @@ fn monitors_match(left: &tauri::Monitor, right: &tauri::Monitor) -> bool {
 pub enum PasteOutcome {
     Pasted,
     CopiedForManualPaste,
+    ClipboardWriteFailed,
 }
 
 pub(crate) trait PasteOperations {
+    fn automatic_paste_available(&self) -> bool;
     fn write_item(&self, item: &PasteContent) -> Result<(), String>;
     fn move_to_top(&self, hash: &str) -> Result<(), String>;
     fn restore_target(&self) -> Result<(), String>;
@@ -270,6 +272,11 @@ impl AppPasteOperations<'_> {
 }
 
 impl PasteOperations for AppPasteOperations<'_> {
+    fn automatic_paste_available(&self) -> bool {
+        self.state.capability_is_available(DesktopCapability::AutomaticPaste)
+            && has_focused_target(self.state)
+    }
+
     fn write_item(&self, item: &PasteContent) -> Result<(), String> {
         self.ensure_session()?;
         let system_clipboard = self
@@ -322,6 +329,15 @@ impl PasteOperations for AppPasteOperations<'_> {
     }
 }
 
+pub(crate) fn resolve_and_paste_with(
+    operations: &impl PasteOperations,
+    hash: &str,
+    resolve: impl FnOnce() -> Result<PasteContent, String>,
+) -> Result<PasteOutcome, String> {
+    let item = resolve()?;
+    paste_with(operations, hash, &item)
+}
+
 pub(crate) fn paste_with(
     operations: &impl PasteOperations,
     hash: &str,
@@ -329,11 +345,15 @@ pub(crate) fn paste_with(
 ) -> Result<PasteOutcome, String> {
     if let Err(error_value) = operations.write_item(item) {
         error!(error:% = error_value; "Failed to write item to clipboard");
-        return Err(error_value);
+        return Ok(PasteOutcome::ClipboardWriteFailed);
     }
 
     if let Err(error_value) = operations.move_to_top(hash) {
         error!(error:% = error_value; "Failed to move copied item to the top");
+        return Ok(PasteOutcome::CopiedForManualPaste);
+    }
+
+    if !operations.automatic_paste_available() {
         return Ok(PasteOutcome::CopiedForManualPaste);
     }
 
@@ -358,16 +378,6 @@ pub(crate) fn paste_with(
 pub fn paste(app: &tauri::AppHandle, state: &AppState, hash: &str) -> Result<PasteOutcome, String> {
     let _paste_guard = state.begin_paste()?;
     let generation = state.picker_session();
-    let item = match state.clipboard.load_for_paste(hash) {
-        Ok(item) => item,
-        Err(crate::storage::ClipboardError::ImageUnavailable {
-            fallback_text: Some(text),
-        }) => {
-            log::warn!("Stored image unavailable; copying its text fallback");
-            PasteContent::Text(text)
-        }
-        Err(error_value) => return Err(error_value.to_string()),
-    };
     let operations = AppPasteOperations {
         app,
         state,
@@ -375,17 +385,19 @@ pub fn paste(app: &tauri::AppHandle, state: &AppState, hash: &str) -> Result<Pas
         reordered: std::cell::Cell::new(false),
     };
 
-    let can_paste_automatically = state.capability_is_available(DesktopCapability::AutomaticPaste)
-        && has_focused_target(state);
-    let outcome = if can_paste_automatically {
-        paste_with(&operations, hash, &item)?
-    } else {
-        operations.write_item(&item)?;
-        if let Err(error_value) = operations.move_to_top(hash) {
-            error!(error:% = error_value; "Failed to move copied item to the top");
+    let can_paste_automatically = operations.automatic_paste_available();
+    let outcome = resolve_and_paste_with(&operations, hash, || {
+        match state.clipboard.load_for_paste(hash) {
+            Ok(item) => Ok(item),
+            Err(crate::storage::ClipboardError::ImageUnavailable {
+                fallback_text: Some(text),
+            }) => {
+                log::warn!("Stored image unavailable; copying its text fallback");
+                Ok(PasteContent::Text(text))
+            }
+            Err(error_value) => Err(error_value.to_string()),
         }
-        PasteOutcome::CopiedForManualPaste
-    };
+    })?;
 
     if operations.reordered.get() {
         if let Err(error_value) = app.emit_clipboard_changed() {
