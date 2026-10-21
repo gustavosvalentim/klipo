@@ -472,9 +472,8 @@ mod tests {
     fn unknown_or_stale_hash_has_no_paste_side_effects() {
         let operations = FakePasteOperations::successful();
 
-        let outcome = resolve_and_paste_with(&operations, "text:unknown", || {
-            Err("Item not found".into())
-        });
+        let outcome =
+            resolve_and_paste_with(&operations, "text:unknown", || Err("Item not found".into()));
 
         assert_eq!(outcome, Err("Item not found".into()));
         assert!(operations.events().is_empty());

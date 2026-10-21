@@ -273,7 +273,8 @@ impl AppPasteOperations<'_> {
 
 impl PasteOperations for AppPasteOperations<'_> {
     fn automatic_paste_available(&self) -> bool {
-        self.state.capability_is_available(DesktopCapability::AutomaticPaste)
+        self.state
+            .capability_is_available(DesktopCapability::AutomaticPaste)
             && has_focused_target(self.state)
     }
 
