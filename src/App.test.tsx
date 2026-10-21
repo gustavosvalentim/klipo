@@ -98,7 +98,7 @@ describe("App", () => {
 		fireEvent.blur(window);
 
 		await waitFor(() => {
-			expect(screen.queryByRole("status")).toBeNull();
+			expect(screen.getByRole("status").textContent).toBe("Copied");
 		});
 
 		fireEvent.keyDown(window, { key: "Escape" });

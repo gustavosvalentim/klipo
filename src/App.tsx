@@ -229,7 +229,6 @@ export function App() {
 
 	const handleBlur = useCallback(() => {
 		setSelectedHash(null);
-		setManualPasteCopied(false);
 	}, [setSelectedHash]);
 
 	const handleFocus = useCallback(() => {

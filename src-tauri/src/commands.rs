@@ -481,6 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_content_before_any_paste_operation() {
+        let operations = FakePasteOperations::successful();
+
+        let outcome = resolve_and_paste_with(&operations, "text:known", || {
+            operations.events.borrow_mut().push("resolve");
+            Ok(PasteContent::Text("copied text".into()))
+        });
+
+        assert_eq!(outcome, Ok(PasteOutcome::Pasted));
+        assert_eq!(
+            operations.events(),
+            ["resolve", "write", "reorder", "restore", "hide", "input"]
+        );
+    }
+
+    #[test]
     fn manual_only_transaction_writes_and_reorders_without_target_or_input_operations() {
         let mut operations = FakePasteOperations::successful();
         operations.automatic_paste_available = false;
