@@ -74,11 +74,37 @@ jobs:
           fi
 
           release_commit="$(git rev-parse HEAD)"
+          release_notes="## macOS installation notice
 
-          gh release create "$RELEASE_TAG" "${dmg_files[@]}" \
-            --target "$release_commit" \
-            --title "$RELEASE_TAG" \
-            --notes "## macOS installation notice
+          The attached app has an ad-hoc signature and is not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance."
+          releases_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
 
-          The attached app has an ad-hoc signature and is not notarized. Download it only from this official GitHub release. See the README for Gatekeeper installation guidance." \
-            --generate-notes
+          for attempt in 1 2 3; do
+            if release_output=$(gh release create "$RELEASE_TAG" "${dmg_files[@]}" \
+              --target "$release_commit" \
+              --title "$RELEASE_TAG" \
+              --notes "$release_notes" \
+              --generate-notes 2>&1); then
+              printf '%s\n' "$release_output"
+              break
+            fi
+
+            printf '%s\n' "$release_output" >&2
+
+            # Retry server errors from draft creation only. Asset upload and publish use other endpoints.
+            if (( attempt == 3 )) || [[ "$release_output" != "HTTP 5"[0-9][0-9]" (${releases_url})" ]]; then
+              exit 1
+            fi
+
+            echo "GitHub returned a server error while creating ${RELEASE_TAG}. Retrying after a release check."
+            sleep "$((attempt * 5))"
+
+            # A server error may still leave a draft. Check before attempting another creation.
+            if existing_release=$(gh release view "$RELEASE_TAG" 2>&1); then
+              echo "A release already exists for ${RELEASE_TAG}. Inspect it before retrying." >&2
+              exit 1
+            elif [[ "$existing_release" != "release not found" ]]; then
+              printf '%s\n' "$existing_release" >&2
+              exit 1
+            fi
+          done
