@@ -99,12 +99,6 @@ export function App() {
 		});
 	}, [setHistoryError]);
 
-	const quitApplication = useCallback(() => {
-		void invoke("quit").catch((error) =>
-			logError("Failed to quit Klipo", error),
-		);
-	}, []);
-
 	const pasteFromSelection = useCallback(
 		async (hash: string) => {
 			invalidatePasteRequest();
@@ -265,13 +259,6 @@ export function App() {
 							onClick={showSettings}
 						>
 							Settings
-						</button>
-						<button
-							type="button"
-							className="menu__control"
-							onClick={quitApplication}
-						>
-							Quit
 						</button>
 						<ClearHistoryButton onClick={clearHistory} />
 					</div>

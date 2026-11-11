@@ -11,6 +11,22 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, PhysicalPosition, Position, WebviewWindow};
 
 pub fn open(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let app_handle = app.clone();
+        app.run_on_main_thread(move || {
+            if let Err(error_value) = open_at_pointer(&app_handle) {
+                error!(error:% = error_value; "Failed to open picker");
+            }
+        })
+        .map_err(|error_value| error_value.to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    open_at_pointer(app)
+}
+
+fn open_at_pointer(app: &tauri::AppHandle) -> Result<(), String> {
     let window = get_main_window(app).ok_or("Picker window unavailable")?;
     let state = app.state::<AppState>();
     let picker_is_focused = window.is_focused();
@@ -35,11 +51,53 @@ pub fn open(app: &tauri::AppHandle) -> Result<(), String> {
 
     let window_position = Position::Physical(get_picker_position(app, &window));
 
-    if let Err(error_value) = window.set_position(window_position) {
-        error!(error:debug = error_value; "Failed to position window");
-        return Err(error_value.to_string());
-    }
+    let app_handle = app.clone();
+    let picker = window.clone();
 
+    position_then_present(
+        || {
+            window
+                .set_position(window_position)
+                .map_err(|error_value| format!("Failed to position picker: {error_value}"))
+        },
+        move || present(&picker, &app_handle.state::<AppState>(), generation),
+        schedule_presentation,
+    )
+}
+
+fn position_then_present<Present>(
+    position: impl FnOnce() -> Result<(), String>,
+    present: Present,
+    schedule_presentation: impl FnOnce(Present) -> Result<(), String>,
+) -> Result<(), String>
+where
+    Present: FnOnce() -> Result<(), String>,
+{
+    position()?;
+    schedule_presentation(present)
+}
+
+#[cfg(target_os = "macos")]
+fn schedule_presentation(
+    present: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    // Tao queues the frame update on this queue, but showing the window is
+    // synchronous. Queue presentation behind the move so its first frame is
+    // at the destination, including when the shortcut runs on the main thread.
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        if let Err(error_value) = present() {
+            error!(error:% = error_value; "Failed to present picker");
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn schedule_presentation(present: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    present()
+}
+
+fn present(window: &WebviewWindow, state: &AppState, generation: u64) -> Result<(), String> {
     if !state.picker_session_is_current(generation) {
         return Err("Picker session was dismissed".into());
     }
@@ -422,6 +480,54 @@ pub fn close(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presents_only_after_the_queued_position_update() {
+        use std::cell::{Cell, RefCell};
+
+        let applied_position = Cell::new((160, 160));
+        let destination = (530, 240);
+        let presented = Cell::new(false);
+        let queue = RefCell::new(Vec::<Box<dyn FnOnce()>>::new());
+
+        position_then_present(
+            || {
+                queue
+                    .borrow_mut()
+                    .push(Box::new(|| applied_position.set(destination)));
+                Ok(())
+            },
+            || {
+                assert_eq!(applied_position.get(), destination);
+                presented.set(true);
+                Ok(())
+            },
+            |present| {
+                queue
+                    .borrow_mut()
+                    .push(Box::new(move || present().unwrap()));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(applied_position.get(), (160, 160));
+        for operation in queue.into_inner() {
+            operation();
+        }
+        assert!(presented.get());
+    }
+
+    #[test]
+    fn does_not_schedule_presentation_when_positioning_fails() {
+        let opening = position_then_present(
+            || Err("Position unavailable".into()),
+            || Ok(()),
+            |_| panic!("Positioning failed, but presentation was scheduled"),
+        );
+
+        assert_eq!(opening, Err("Position unavailable".into()));
+    }
     const PICKER_SIZE: (u32, u32) = (250, 350);
 
     #[test]

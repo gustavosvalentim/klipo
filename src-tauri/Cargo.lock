@@ -2065,6 +2065,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "clipboard-rs",
+ "dispatch2",
  "enigo",
  "image",
  "log",

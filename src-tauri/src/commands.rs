@@ -136,11 +136,6 @@ pub fn paste(
     crate::picker::paste(&app, &state, hash)
 }
 
-#[tauri::command]
-pub fn quit(app: AppHandle) {
-    exit_application(&app);
-}
-
 pub(crate) fn exit_application(app: &AppHandle) {
     app.exit(0);
 }
