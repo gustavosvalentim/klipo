@@ -13,6 +13,7 @@ pub(crate) const PICKER_HEIGHT: f64 = 350.0;
 pub fn create_picker_window(app: &tauri::AppHandle) -> Result<WebviewWindow, tauri::Error> {
     let window_builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::default())
         .inner_size(PICKER_WIDTH, PICKER_HEIGHT)
+        .resizable(false)
         .decorations(false)
         .transparent(cfg!(target_os = "macos"))
         .always_on_top(true)

@@ -194,19 +194,17 @@ describe("App", () => {
 		expect(history?.className).not.toContain("has-keyboard-selection");
 	});
 
-	it("activates settings and quit controls with Enter without a tray", async () => {
+	it("activates Settings with Enter and keeps Quit out of the picker", async () => {
 		await renderPicker();
 
 		const settings = screen.getByRole("button", { name: "Settings" });
-		const quit = screen.getByRole("button", { name: "Quit" });
 
 		settings.focus();
 		expect(document.activeElement).toBe(settings);
 		activateWithEnter(settings);
-		activateWithEnter(quit);
 
 		expect(mocks.invoke).toHaveBeenCalledWith("show_settings");
-		expect(mocks.invoke).toHaveBeenCalledWith("quit");
+		expect(screen.queryByRole("button", { name: "Quit" })).toBeNull();
 	});
 
 	it("closes the picker when Escape is pressed from a focused control", async () => {

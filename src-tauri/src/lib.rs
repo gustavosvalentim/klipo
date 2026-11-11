@@ -17,7 +17,7 @@ mod window;
 use clipboard::{ClipboardEventsListener, SystemClipboard};
 use commands::{
     clear, close, close_settings, delete_item, fetch_clipboard, get_capabilities, get_shortcuts,
-    log_frontend_error, paste, quit, save_shortcuts, show_settings,
+    log_frontend_error, paste, save_shortcuts, show_settings,
 };
 use desktop::{CapabilityStatus, CapabilityUnavailableReason, DesktopCapability, DesktopSession};
 use input::supports_input;
@@ -50,7 +50,6 @@ pub fn run() {
             log_frontend_error,
             paste,
             clear,
-            quit,
             show_settings,
             close,
             close_settings,
