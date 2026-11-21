@@ -61,15 +61,6 @@ function nextTick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function activateWithEnter(button: HTMLElement) {
-	const defaultWasAllowed = fireEvent.keyDown(button, {
-		code: "Enter",
-		key: "Enter",
-	});
-
-	if (defaultWasAllowed) fireEvent.click(button);
-}
-
 describe("App", () => {
 	beforeEach(() => {
 		HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -194,25 +185,19 @@ describe("App", () => {
 		expect(history?.className).not.toContain("has-keyboard-selection");
 	});
 
-	it("activates Settings with Enter and keeps Quit out of the picker", async () => {
+	it("keeps Settings and Quit out of the picker", async () => {
 		await renderPicker();
 
-		const settings = screen.getByRole("button", { name: "Settings" });
-
-		settings.focus();
-		expect(document.activeElement).toBe(settings);
-		activateWithEnter(settings);
-
-		expect(mocks.invoke).toHaveBeenCalledWith("show_settings");
+		expect(screen.queryByRole("button", { name: "Settings" })).toBeNull();
 		expect(screen.queryByRole("button", { name: "Quit" })).toBeNull();
 	});
 
 	it("closes the picker when Escape is pressed from a focused control", async () => {
 		await renderPicker();
 
-		const settings = screen.getByRole("button", { name: "Settings" });
-		settings.focus();
-		fireEvent.keyDown(settings, { code: "Escape", key: "Escape" });
+		const clearHistory = screen.getByRole("button", { name: "Clear history" });
+		clearHistory.focus();
+		fireEvent.keyDown(clearHistory, { code: "Escape", key: "Escape" });
 
 		await waitFor(() => {
 			expect(mocks.invoke).toHaveBeenCalledWith("close");
