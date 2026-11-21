@@ -92,13 +92,6 @@ export function App() {
 		}
 	}, [invalidatePasteRequest, refreshHistory, setHistoryError]);
 
-	const showSettings = useCallback(() => {
-		void invoke("show_settings").catch((error) => {
-			logError("Failed to show settings", error);
-			setHistoryError(String(error));
-		});
-	}, [setHistoryError]);
-
 	const pasteFromSelection = useCallback(
 		async (hash: string) => {
 			invalidatePasteRequest();
@@ -252,16 +245,7 @@ export function App() {
 						<span className="text-base font-bold">Klipo</span>
 					</div>
 
-					<div className="flex items-center gap-1">
-						<button
-							type="button"
-							className="menu__control"
-							onClick={showSettings}
-						>
-							Settings
-						</button>
-						<ClearHistoryButton onClick={clearHistory} />
-					</div>
+					<ClearHistoryButton onClick={clearHistory} />
 				</div>
 				{manualPasteCopied && (
 					<p role="status" aria-live="polite" className="mx-2 text-sm">
